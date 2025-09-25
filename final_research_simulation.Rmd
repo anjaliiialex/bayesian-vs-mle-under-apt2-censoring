@@ -1,0 +1,1764 @@
+---
+title: "Final Research w multiple n values"
+author: "Anjali Alex"
+date: "2025-09-25"
+output: html_document
+---
+
+
+### n = 50, r = 30
+```{r}
+### Working Solution: Create Our Own Verified Dagum Implementation
+library(future)
+library(future.apply)
+library(rstan)
+library(optimx)
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+### 1. Create Our Own Verified Dagum Functions
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+# Dagum PDF: f(x; a, b, p) = (a*p/x^(p+1)) * b^p / (1 + (x/b)^(-p))^(a+1)
+dagum_pdf <- function(x, a, b, p) {
+  if (any(x <= 0) || a <= 0 || b <= 0 || p <= 0) return(rep(0, length(x)))
+  
+  term1 <- a * p
+  term2 <- x^(-(p + 1))
+  term3 <- b^p
+  term4 <- (1 + (x/b)^(-p))^(-(a + 1))
+  
+  return(term1 * term2 * term3 * term4)
+}
+
+# Dagum CDF: F(x; a, b, p) = 1 - (1 + (x/b)^(-p))^(-a)
+dagum_cdf <- function(x, a, b, p) {
+  if (any(x <= 0) || a <= 0 || b <= 0 || p <= 0) return(rep(0, length(x)))
+  
+  return(1 - (1 + (x/b)^(-p))^(-a))
+}
+
+# Dagum random generation using inverse transform
+dagum_random <- function(n, a, b, p) {
+  if (a <= 0 || b <= 0 || p <= 0) stop("Parameters must be positive")
+  
+  u <- runif(n)
+  # Inverse CDF: x = b * ((1-u)^(-1/a) - 1)^(-1/p)
+  x <- b * ((1 - u)^(-1/a) - 1)^(-1/p)
+  
+  return(x)
+}
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+### 2. Verify Our Implementation Works
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+verify_our_implementation <- function() {
+  cat("=== VERIFYING OUR DAGUM IMPLEMENTATION ===\n")
+  
+  # Test parameters
+  a <- 2.5; b <- 1.5; p <- 1.2
+  
+  # Generate test data
+  set.seed(123)
+  test_data <- dagum_random(n = 1000, a = a, b = b, p = p)
+  
+  cat("Generated data summary: min=", round(min(test_data), 3), 
+      ", mean=", round(mean(test_data), 3), 
+      ", max=", round(max(test_data), 3), "\n")
+  
+  # Test parameter recovery
+  our_negloglik <- function(par, data) {
+    if (any(par <= 0)) return(1e20)
+    pdf_vals <- dagum_pdf(data, par[1], par[2], p)
+    if (any(pdf_vals <= 0)) return(1e20)
+    return(-sum(log(pdf_vals)))
+  }
+  
+  recovery_fit <- optimx(par = c(1, 1), fn = our_negloglik, data = test_data,
+                        method = "nlminb", lower = c(0.1, 0.1), upper = c(10, 10))
+  
+  if (recovery_fit$convcode == 0) {
+    recovered_a <- recovery_fit$p1
+    recovered_b <- recovery_fit$p2
+    
+    cat("Parameter recovery test:\n")
+    cat("True:      a =", a, ", b =", b, "\n")
+    cat("Recovered: a =", round(recovered_a, 3), ", b =", round(recovered_b, 3), "\n")
+    
+    success_a <- abs(recovered_a - a) < 0.2
+    success_b <- abs(recovered_b - b) < 0.2
+    
+    cat("Recovery successful: a =", success_a, ", b =", success_b, "\n")
+    
+    if (success_a && success_b) {
+      cat("*** OUR IMPLEMENTATION WORKS! ***\n")
+      return(TRUE)
+    }
+  }
+  
+  cat("Parameter recovery failed\n")
+  return(FALSE)
+}
+
+# Test our implementation
+implementation_works <- verify_our_implementation()
+
+if (!implementation_works) {
+  stop("Our Dagum implementation doesn't work properly. Check the mathematical formulation.")
+}
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+### 3. Progressive Censoring Likelihood with Our Functions
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+negloglik_progressive_censored_verified <- function(par, data, R, p_fixed) {
+  a <- par[1]; b <- par[2]
+  if (a <= 0 || b <= 0 || !is.finite(a) || !is.finite(b)) return(1e20)
+  
+  # Log-likelihood from observed failures
+  pdf_vals <- dagum_pdf(data, a, b, p_fixed)
+  if (any(pdf_vals <= 0) || any(!is.finite(pdf_vals))) return(1e20)
+  ll_failures <- sum(log(pdf_vals))
+  
+  # Log-likelihood from censored observations
+  if (sum(R) > 0) {
+    cdf_vals <- dagum_cdf(data, a, b, p_fixed)
+    survival_vals <- 1 - cdf_vals
+    if (any(survival_vals <= 0) || any(!is.finite(survival_vals))) return(1e20)
+    ll_censored <- sum(R * log(survival_vals))
+  } else {
+    ll_censored <- 0
+  }
+  
+  return(-(ll_failures + ll_censored))
+}
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+### 4. Verified Stan Model
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+verified_stan_code <- '
+functions {
+  real dagum_lpdf(real x, real a, real b, real p) {
+    if (x <= 0) return negative_infinity();
+    
+    real log_pdf = log(a) + log(p) - (p + 1) * log(x) + p * log(b) - (a + 1) * log1p(pow(x/b, -p));
+    return log_pdf;
+  }
+  
+  real dagum_lccdf(real x, real a, real b, real p) {
+    if (x <= 0) return 0;
+    
+    return -a * log1p(pow(x/b, -p));
+  }
+}
+
+data {
+  int<lower=0> N_obs;
+  vector<lower=0>[N_obs] y_obs;
+  int<lower=0> R[N_obs];
+  real<lower=0> p;
+}
+
+parameters {
+  real<lower=0> a;
+  real<lower=0> b;
+}
+
+model {
+  // Weakly informative priors
+  a ~ gamma(2, 1);  // mean = 2, variance = 2
+  b ~ gamma(2, 1);  // mean = 2, variance = 2
+  
+  // Likelihood
+  for (i in 1:N_obs) {
+    target += dagum_lpdf(y_obs[i] | a, b, p);
+  }
+  
+  for (i in 1:N_obs) {
+    if (R[i] > 0) {
+      target += R[i] * dagum_lccdf(y_obs[i] | a, b, p);
+    }
+  }
+}
+'
+
+writeLines(verified_stan_code, "dagum_verified.stan")
+
+# Compile Stan model
+cat("Compiling verified Stan model...\n")
+stan_model_compiled <- rstan::stan_model("dagum_verified.stan")
+cat("Stan model compiled successfully!\n")
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+### 5. Working Simulation Function
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+run_verified_simulation <- function(sim_id, n_total, r, R_planned, T_ideal, true_a, true_b, true_p, compiled_model) {
+  
+  set.seed(100 + sim_id)
+  
+  # Generate data using OUR verified function
+  y_full <- sort(dagum_random(n = n_total, a = true_a, b = true_b, p = true_p))
+  
+  y_obs <- numeric(r)
+  R_final <- R_planned
+  current_n <- n_total
+  full_data_idx <- 1
+  adapted <- FALSE
+  
+  # Adaptive progressive censoring
+  for (i in 1:r) {
+    y_obs[i] <- y_full[full_data_idx]
+    
+    if (!adapted && y_obs[i] > T_ideal) {
+      adapted <- TRUE
+      removed_so_far <- if (i > 1) sum(R_final[1:(i-1)]) else 0
+      if (i < r) {
+        R_final[i:r] <- 0
+      }
+      R_final[r] <- n_total - r - removed_so_far
+    }
+    
+    n_removed_this_step <- 1 + R_final[i]
+    full_data_idx <- full_data_idx + n_removed_this_step
+    current_n <- current_n - n_removed_this_step
+  }
+  
+  y <- pmax(y_obs, 1e-6)
+  
+  results <- data.frame(
+    mle_a = NA, mle_b = NA, bayes_a = NA, bayes_b = NA,
+    mle_cov_a = NA, mle_cov_b = NA, bayes_cov_a = NA, bayes_cov_b = NA,
+    mle_width_a = NA, mle_width_b = NA, bayes_width_a = NA, bayes_width_b = NA,
+    mle_time = NA, bayes_time = NA, adapted = adapted,
+    divergences = NA, valid_bayes = FALSE
+  )
+
+  # MLE estimation using verified likelihood
+  mle_start_time <- Sys.time()
+  
+  # Multiple starting points for robustness
+  start_points <- list(c(1, 1), c(2, mean(y)), c(true_a*0.8, true_b*0.8))
+  
+  best_mle <- NULL
+  best_nll <- Inf
+  
+  for (start_par in start_points) {
+    mle_fit <- try(optimx(par = start_par, 
+                          fn = negloglik_progressive_censored_verified,
+                          data = y, R = R_final, p_fixed = true_p,
+                          method = "nlminb", lower = c(0.1, 0.1), upper = c(10, 10)), silent = TRUE)
+    
+    if (!inherits(mle_fit, "try-error") && mle_fit$convcode == 0 && mle_fit$value < best_nll) {
+      best_mle <- mle_fit
+      best_nll <- mle_fit$value
+    }
+  }
+  
+  results$mle_time <- as.numeric(difftime(Sys.time(), mle_start_time, units = "secs"))
+  
+  if (!is.null(best_mle)) {
+    results$mle_a <- best_mle$p1
+    results$mle_b <- best_mle$p2
+    
+    # Bootstrap confidence intervals (more reliable than Hessian)
+    bootstrap_cis <- try({
+      n_boot <- 200
+      boot_results <- matrix(NA, n_boot, 2)
+      
+      for (b in 1:n_boot) {
+        # Bootstrap sample
+        boot_indices <- sample(length(y), replace = TRUE)
+        boot_y <- y[boot_indices]
+        boot_R <- R_final[boot_indices]
+        
+        boot_fit <- try(optimx(par = c(results$mle_a, results$mle_b),
+                               fn = negloglik_progressive_censored_verified,
+                               data = boot_y, R = boot_R, p_fixed = true_p,
+                               method = "nlminb", lower = c(0.1, 0.1), upper = c(10, 10)), silent = TRUE)
+        
+        if (!inherits(boot_fit, "try-error") && boot_fit$convcode == 0) {
+          boot_results[b, ] <- c(boot_fit$p1, boot_fit$p2)
+        }
+      }
+      
+      # Remove failed bootstrap samples
+      valid_boots <- complete.cases(boot_results)
+      if (sum(valid_boots) >= 50) {
+        boot_results <- boot_results[valid_boots, ]
+        
+        ci_a <- quantile(boot_results[, 1], c(0.025, 0.975), na.rm = TRUE)
+        ci_b <- quantile(boot_results[, 2], c(0.025, 0.975), na.rm = TRUE)
+        
+        list(ci_a = ci_a, ci_b = ci_b)
+      } else {
+        NULL
+      }
+    }, silent = TRUE)
+    
+    if (!inherits(bootstrap_cis, "try-error") && !is.null(bootstrap_cis)) {
+      results$mle_width_a <- bootstrap_cis$ci_a[2] - bootstrap_cis$ci_a[1]
+      results$mle_width_b <- bootstrap_cis$ci_b[2] - bootstrap_cis$ci_b[1]
+      results$mle_cov_a <- (true_a >= bootstrap_cis$ci_a[1] && true_a <= bootstrap_cis$ci_a[2])
+      results$mle_cov_b <- (true_b >= bootstrap_cis$ci_b[1] && true_b <= bootstrap_cis$ci_b[2])
+    }
+  }
+
+  # Bayesian estimation
+  bayes_start_time <- Sys.time()
+  stan_data <- list(N_obs = length(y), y_obs = y, R = R_final, p = true_p)
+  
+  stan_fit <- try(rstan::sampling(
+    object = compiled_model,
+    data = stan_data,
+    chains = 4, iter = 2000, warmup = 1000,
+    verbose = FALSE, refresh = 0,
+    control = list(adapt_delta = 0.95)
+  ), silent = TRUE)
+  
+  results$bayes_time <- as.numeric(difftime(Sys.time(), bayes_start_time, units = "secs"))
+  
+  if (!inherits(stan_fit, "try-error")) {
+    sampler_params <- get_sampler_params(stan_fit, inc_warmup = FALSE)
+    divergences <- sum(sapply(sampler_params, function(x) sum(x[, "divergent__"])))
+    results$divergences <- divergences
+    
+    summary_stats <- rstan::summary(stan_fit)$summary
+    rhats <- summary_stats[, "Rhat"]
+    
+    if (all(rhats < 1.1, na.rm = TRUE) && divergences <= 10) {
+      results$valid_bayes <- TRUE
+      results$bayes_a <- summary_stats["a", "mean"]
+      results$bayes_b <- summary_stats["b", "mean"]
+      
+      results$bayes_width_a <- summary_stats["a", "97.5%"] - summary_stats["a", "2.5%"]
+      results$bayes_width_b <- summary_stats["b", "97.5%"] - summary_stats["b", "2.5%"]
+      results$bayes_cov_a <- (true_a >= summary_stats["a", "2.5%"] && true_a <= summary_stats["a", "97.5%"])
+      results$bayes_cov_b <- (true_b >= summary_stats["b", "2.5%"] && true_b <= summary_stats["b", "97.5%"])
+    }
+  }
+  
+  return(results)
+}
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+### 6. Run the Verified Simulation
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+# Simulation parameters
+n_sim <- 1000
+n_total <- 50
+r <- 30
+true_a <- 2.5
+true_b <- 1.5
+true_p <- 1.2
+T_ideal <- 2.0
+R_planned <- c(rep(0, r - 1), n_total - r)
+
+plan(multisession)
+
+cat("Starting VERIFIED simulation with consistent Dagum implementation...\n")
+start_time <- Sys.time()
+
+results_list <- future_lapply(1:n_sim, FUN = run_verified_simulation,
+                              n_total = n_total, r = r, R_planned = R_planned, T_ideal = T_ideal,
+                              true_a = true_a, true_b = true_b, true_p = true_p,
+                              compiled_model = stan_model_compiled,
+                              future.seed = TRUE)
+
+end_time <- Sys.time()
+cat("Verified simulation complete. Time:", round(end_time - start_time, 2), "seconds\n")
+
+# Process results
+final_results_df <- do.call(rbind, results_list)
+valid_results <- final_results_df[final_results_df$valid_bayes == TRUE, ]
+
+cat(sprintf("Valid Bayesian results: %d out of %d (%.1f%%)\n", 
+            nrow(valid_results), nrow(final_results_df), 
+            100 * nrow(valid_results) / nrow(final_results_df)))
+
+if (nrow(valid_results) >= 20) {
+  
+  summary_a <- data.frame(
+    Metric = c("Bias", "AbsBias", "MSE", "Coverage", "Width"),
+    MLE = c(
+      mean(valid_results$mle_a - true_a, na.rm = TRUE),
+      mean(abs(valid_results$mle_a - true_a), na.rm = TRUE),
+      mean((valid_results$mle_a - true_a)^2, na.rm = TRUE),
+      mean(valid_results$mle_cov_a, na.rm = TRUE),
+      mean(valid_results$mle_width_a, na.rm = TRUE)
+    ),
+    Bayes = c(
+      mean(valid_results$bayes_a - true_a, na.rm = TRUE),
+      mean(abs(valid_results$bayes_a - true_a), na.rm = TRUE),
+      mean((valid_results$bayes_a - true_a)^2, na.rm = TRUE),
+      mean(valid_results$bayes_cov_a, na.rm = TRUE),
+      mean(valid_results$bayes_width_a, na.rm = TRUE)
+    )
+  )
+  
+  summary_b <- data.frame(
+    Metric = c("Bias", "AbsBias", "MSE", "Coverage", "Width"),
+    MLE = c(
+      mean(valid_results$mle_b - true_b, na.rm = TRUE),
+      mean(abs(valid_results$mle_b - true_b), na.rm = TRUE),
+      mean((valid_results$mle_b - true_b)^2, na.rm = TRUE),
+      mean(valid_results$mle_cov_b, na.rm = TRUE),
+      mean(valid_results$mle_width_b, na.rm = TRUE)
+    ),
+    Bayes = c(
+      mean(valid_results$bayes_b - true_b, na.rm = TRUE),
+      mean(abs(valid_results$bayes_b - true_b), na.rm = TRUE),
+      mean((valid_results$bayes_b - true_b)^2, na.rm = TRUE),
+      mean(valid_results$bayes_cov_b, na.rm = TRUE),
+      mean(valid_results$bayes_width_b, na.rm = TRUE)
+    )
+  )
+  
+  cat("\n=== VERIFIED SIMULATION RESULTS ===\n")
+  cat("--- Parameter 'a' ---\n")
+  print(summary_a, row.names = FALSE, digits = 4)
+  cat("\n--- Parameter 'b' ---\n")
+  print(summary_b, row.names = FALSE, digits = 4)
+  
+  cat("\n--- SUCCESS INDICATORS ---\n")
+  if (summary_a$Bayes[3] < summary_a$MLE[3]) cat("✓ Bayesian MSE better for parameter 'a'\n")
+  if (summary_b$Bayes[3] < summary_b$MLE[3]) cat("✓ Bayesian MSE better for parameter 'b'\n")
+  if (summary_a$Bayes[2] < summary_a$MLE[2]) cat("✓ Bayesian absolute bias better for parameter 'a'\n")
+  if (summary_b$Bayes[2] < summary_b$MLE[2]) cat("✓ Bayesian absolute bias better for parameter 'b'\n")
+  if (summary_a$Bayes[4] > 0.9) cat("✓ Good Bayesian coverage for parameter 'a'\n")
+  if (summary_b$Bayes[4] > 0.9) cat("✓ Good Bayesian coverage for parameter 'b'\n")
+  
+  cat("\n--- Diagnostics ---\n")
+  cat("Average divergences:", round(mean(valid_results$divergences, na.rm = TRUE), 1), "\n")
+  cat("Adaptation rate:", round(100 * mean(valid_results$adapted, na.rm = TRUE), 1), "%\n")
+  
+} else {
+  cat("Insufficient successful results. Check implementation.\n")
+}
+
+cat("\n=== VERIFIED SIMULATION COMPLETE ===\n")
+cat("This implementation uses consistent Dagum functions throughout.\n")
+cat("If results are still problematic, the issue may be with the progressive censoring scheme or parameter values.\n")
+```
+
+
+
+
+### n = 100, r = 60
+```{r}
+### Working Solution: Create Our Own Verified Dagum Implementation
+library(future)
+library(future.apply)
+library(rstan)
+library(optimx)
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+### 1. Create Our Own Verified Dagum Functions
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+# Dagum PDF: f(x; a, b, p) = (a*p/x^(p+1)) * b^p / (1 + (x/b)^(-p))^(a+1)
+dagum_pdf <- function(x, a, b, p) {
+  if (any(x <= 0) || a <= 0 || b <= 0 || p <= 0) return(rep(0, length(x)))
+  
+  term1 <- a * p
+  term2 <- x^(-(p + 1))
+  term3 <- b^p
+  term4 <- (1 + (x/b)^(-p))^(-(a + 1))
+  
+  return(term1 * term2 * term3 * term4)
+}
+
+# Dagum CDF: F(x; a, b, p) = 1 - (1 + (x/b)^(-p))^(-a)
+dagum_cdf <- function(x, a, b, p) {
+  if (any(x <= 0) || a <= 0 || b <= 0 || p <= 0) return(rep(0, length(x)))
+  
+  return(1 - (1 + (x/b)^(-p))^(-a))
+}
+
+# Dagum random generation using inverse transform
+dagum_random <- function(n, a, b, p) {
+  if (a <= 0 || b <= 0 || p <= 0) stop("Parameters must be positive")
+  
+  u <- runif(n)
+  # Inverse CDF: x = b * ((1-u)^(-1/a) - 1)^(-1/p)
+  x <- b * ((1 - u)^(-1/a) - 1)^(-1/p)
+  
+  return(x)
+}
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+### 2. Verify Our Implementation Works
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+verify_our_implementation <- function() {
+  cat("=== VERIFYING OUR DAGUM IMPLEMENTATION ===\n")
+  
+  # Test parameters
+  a <- 2.5; b <- 1.5; p <- 1.2
+  
+  # Generate test data
+  set.seed(123)
+  test_data <- dagum_random(n = 1000, a = a, b = b, p = p)
+  
+  cat("Generated data summary: min=", round(min(test_data), 3), 
+      ", mean=", round(mean(test_data), 3), 
+      ", max=", round(max(test_data), 3), "\n")
+  
+  # Test parameter recovery
+  our_negloglik <- function(par, data) {
+    if (any(par <= 0)) return(1e20)
+    pdf_vals <- dagum_pdf(data, par[1], par[2], p)
+    if (any(pdf_vals <= 0)) return(1e20)
+    return(-sum(log(pdf_vals)))
+  }
+  
+  recovery_fit <- optimx(par = c(1, 1), fn = our_negloglik, data = test_data,
+                        method = "nlminb", lower = c(0.1, 0.1), upper = c(10, 10))
+  
+  if (recovery_fit$convcode == 0) {
+    recovered_a <- recovery_fit$p1
+    recovered_b <- recovery_fit$p2
+    
+    cat("Parameter recovery test:\n")
+    cat("True:      a =", a, ", b =", b, "\n")
+    cat("Recovered: a =", round(recovered_a, 3), ", b =", round(recovered_b, 3), "\n")
+    
+    success_a <- abs(recovered_a - a) < 0.2
+    success_b <- abs(recovered_b - b) < 0.2
+    
+    cat("Recovery successful: a =", success_a, ", b =", success_b, "\n")
+    
+    if (success_a && success_b) {
+      cat("*** OUR IMPLEMENTATION WORKS! ***\n")
+      return(TRUE)
+    }
+  }
+  
+  cat("Parameter recovery failed\n")
+  return(FALSE)
+}
+
+# Test our implementation
+implementation_works <- verify_our_implementation()
+
+if (!implementation_works) {
+  stop("Our Dagum implementation doesn't work properly. Check the mathematical formulation.")
+}
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+### 3. Progressive Censoring Likelihood with Our Functions
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+negloglik_progressive_censored_verified <- function(par, data, R, p_fixed) {
+  a <- par[1]; b <- par[2]
+  if (a <= 0 || b <= 0 || !is.finite(a) || !is.finite(b)) return(1e20)
+  
+  # Log-likelihood from observed failures
+  pdf_vals <- dagum_pdf(data, a, b, p_fixed)
+  if (any(pdf_vals <= 0) || any(!is.finite(pdf_vals))) return(1e20)
+  ll_failures <- sum(log(pdf_vals))
+  
+  # Log-likelihood from censored observations
+  if (sum(R) > 0) {
+    cdf_vals <- dagum_cdf(data, a, b, p_fixed)
+    survival_vals <- 1 - cdf_vals
+    if (any(survival_vals <= 0) || any(!is.finite(survival_vals))) return(1e20)
+    ll_censored <- sum(R * log(survival_vals))
+  } else {
+    ll_censored <- 0
+  }
+  
+  return(-(ll_failures + ll_censored))
+}
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+### 4. Verified Stan Model
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+verified_stan_code <- '
+functions {
+  real dagum_lpdf(real x, real a, real b, real p) {
+    if (x <= 0) return negative_infinity();
+    
+    real log_pdf = log(a) + log(p) - (p + 1) * log(x) + p * log(b) - (a + 1) * log1p(pow(x/b, -p));
+    return log_pdf;
+  }
+  
+  real dagum_lccdf(real x, real a, real b, real p) {
+    if (x <= 0) return 0;
+    
+    return -a * log1p(pow(x/b, -p));
+  }
+}
+
+data {
+  int<lower=0> N_obs;
+  vector<lower=0>[N_obs] y_obs;
+  int<lower=0> R[N_obs];
+  real<lower=0> p;
+}
+
+parameters {
+  real<lower=0> a;
+  real<lower=0> b;
+}
+
+model {
+  // Weakly informative priors
+  a ~ gamma(2, 1);  // mean = 2, variance = 2
+  b ~ gamma(2, 1);  // mean = 2, variance = 2
+  
+  // Likelihood
+  for (i in 1:N_obs) {
+    target += dagum_lpdf(y_obs[i] | a, b, p);
+  }
+  
+  for (i in 1:N_obs) {
+    if (R[i] > 0) {
+      target += R[i] * dagum_lccdf(y_obs[i] | a, b, p);
+    }
+  }
+}
+'
+
+writeLines(verified_stan_code, "dagum_verified.stan")
+
+# Compile Stan model
+cat("Compiling verified Stan model...\n")
+stan_model_compiled <- rstan::stan_model("dagum_verified.stan")
+cat("Stan model compiled successfully!\n")
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+### 5. Working Simulation Function
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+run_verified_simulation <- function(sim_id, n_total, r, R_planned, T_ideal, true_a, true_b, true_p, compiled_model) {
+  
+  set.seed(100 + sim_id)
+  
+  # Generate data using OUR verified function
+  y_full <- sort(dagum_random(n = n_total, a = true_a, b = true_b, p = true_p))
+  
+  y_obs <- numeric(r)
+  R_final <- R_planned
+  current_n <- n_total
+  full_data_idx <- 1
+  adapted <- FALSE
+  
+  # Adaptive progressive censoring
+  for (i in 1:r) {
+    y_obs[i] <- y_full[full_data_idx]
+    
+    if (!adapted && y_obs[i] > T_ideal) {
+      adapted <- TRUE
+      removed_so_far <- if (i > 1) sum(R_final[1:(i-1)]) else 0
+      if (i < r) {
+        R_final[i:r] <- 0
+      }
+      R_final[r] <- n_total - r - removed_so_far
+    }
+    
+    n_removed_this_step <- 1 + R_final[i]
+    full_data_idx <- full_data_idx + n_removed_this_step
+    current_n <- current_n - n_removed_this_step
+  }
+  
+  y <- pmax(y_obs, 1e-6)
+  
+  results <- data.frame(
+    mle_a = NA, mle_b = NA, bayes_a = NA, bayes_b = NA,
+    mle_cov_a = NA, mle_cov_b = NA, bayes_cov_a = NA, bayes_cov_b = NA,
+    mle_width_a = NA, mle_width_b = NA, bayes_width_a = NA, bayes_width_b = NA,
+    mle_time = NA, bayes_time = NA, adapted = adapted,
+    divergences = NA, valid_bayes = FALSE
+  )
+
+  # MLE estimation using verified likelihood
+  mle_start_time <- Sys.time()
+  
+  # Multiple starting points for robustness
+  start_points <- list(c(1, 1), c(2, mean(y)), c(true_a*0.8, true_b*0.8))
+  
+  best_mle <- NULL
+  best_nll <- Inf
+  
+  for (start_par in start_points) {
+    mle_fit <- try(optimx(par = start_par, 
+                          fn = negloglik_progressive_censored_verified,
+                          data = y, R = R_final, p_fixed = true_p,
+                          method = "nlminb", lower = c(0.1, 0.1), upper = c(10, 10)), silent = TRUE)
+    
+    if (!inherits(mle_fit, "try-error") && mle_fit$convcode == 0 && mle_fit$value < best_nll) {
+      best_mle <- mle_fit
+      best_nll <- mle_fit$value
+    }
+  }
+  
+  results$mle_time <- as.numeric(difftime(Sys.time(), mle_start_time, units = "secs"))
+  
+  if (!is.null(best_mle)) {
+    results$mle_a <- best_mle$p1
+    results$mle_b <- best_mle$p2
+    
+    # Bootstrap confidence intervals (more reliable than Hessian)
+    bootstrap_cis <- try({
+      n_boot <- 200
+      boot_results <- matrix(NA, n_boot, 2)
+      
+      for (b in 1:n_boot) {
+        # Bootstrap sample
+        boot_indices <- sample(length(y), replace = TRUE)
+        boot_y <- y[boot_indices]
+        boot_R <- R_final[boot_indices]
+        
+        boot_fit <- try(optimx(par = c(results$mle_a, results$mle_b),
+                               fn = negloglik_progressive_censored_verified,
+                               data = boot_y, R = boot_R, p_fixed = true_p,
+                               method = "nlminb", lower = c(0.1, 0.1), upper = c(10, 10)), silent = TRUE)
+        
+        if (!inherits(boot_fit, "try-error") && boot_fit$convcode == 0) {
+          boot_results[b, ] <- c(boot_fit$p1, boot_fit$p2)
+        }
+      }
+      
+      # Remove failed bootstrap samples
+      valid_boots <- complete.cases(boot_results)
+      if (sum(valid_boots) >= 50) {
+        boot_results <- boot_results[valid_boots, ]
+        
+        ci_a <- quantile(boot_results[, 1], c(0.025, 0.975), na.rm = TRUE)
+        ci_b <- quantile(boot_results[, 2], c(0.025, 0.975), na.rm = TRUE)
+        
+        list(ci_a = ci_a, ci_b = ci_b)
+      } else {
+        NULL
+      }
+    }, silent = TRUE)
+    
+    if (!inherits(bootstrap_cis, "try-error") && !is.null(bootstrap_cis)) {
+      results$mle_width_a <- bootstrap_cis$ci_a[2] - bootstrap_cis$ci_a[1]
+      results$mle_width_b <- bootstrap_cis$ci_b[2] - bootstrap_cis$ci_b[1]
+      results$mle_cov_a <- (true_a >= bootstrap_cis$ci_a[1] && true_a <= bootstrap_cis$ci_a[2])
+      results$mle_cov_b <- (true_b >= bootstrap_cis$ci_b[1] && true_b <= bootstrap_cis$ci_b[2])
+    }
+  }
+
+  # Bayesian estimation
+  bayes_start_time <- Sys.time()
+  stan_data <- list(N_obs = length(y), y_obs = y, R = R_final, p = true_p)
+  
+  stan_fit <- try(rstan::sampling(
+    object = compiled_model,
+    data = stan_data,
+    chains = 4, iter = 2000, warmup = 1000,
+    verbose = FALSE, refresh = 0,
+    control = list(adapt_delta = 0.95)
+  ), silent = TRUE)
+  
+  results$bayes_time <- as.numeric(difftime(Sys.time(), bayes_start_time, units = "secs"))
+  
+  if (!inherits(stan_fit, "try-error")) {
+    sampler_params <- get_sampler_params(stan_fit, inc_warmup = FALSE)
+    divergences <- sum(sapply(sampler_params, function(x) sum(x[, "divergent__"])))
+    results$divergences <- divergences
+    
+    summary_stats <- rstan::summary(stan_fit)$summary
+    rhats <- summary_stats[, "Rhat"]
+    
+    if (all(rhats < 1.1, na.rm = TRUE) && divergences <= 10) {
+      results$valid_bayes <- TRUE
+      results$bayes_a <- summary_stats["a", "mean"]
+      results$bayes_b <- summary_stats["b", "mean"]
+      
+      results$bayes_width_a <- summary_stats["a", "97.5%"] - summary_stats["a", "2.5%"]
+      results$bayes_width_b <- summary_stats["b", "97.5%"] - summary_stats["b", "2.5%"]
+      results$bayes_cov_a <- (true_a >= summary_stats["a", "2.5%"] && true_a <= summary_stats["a", "97.5%"])
+      results$bayes_cov_b <- (true_b >= summary_stats["b", "2.5%"] && true_b <= summary_stats["b", "97.5%"])
+    }
+  }
+  
+  return(results)
+}
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+### 6. Run the Verified Simulation
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+# Simulation parameters
+n_sim <- 1000
+n_total <- 100
+r <- 60
+true_a <- 2.5
+true_b <- 1.5
+true_p <- 1.2
+T_ideal <- 2.0
+R_planned <- c(rep(0, r - 1), n_total - r)
+
+plan(multisession)
+
+cat("Starting VERIFIED simulation with consistent Dagum implementation...\n")
+start_time <- Sys.time()
+
+results_list <- future_lapply(1:n_sim, FUN = run_verified_simulation,
+                              n_total = n_total, r = r, R_planned = R_planned, T_ideal = T_ideal,
+                              true_a = true_a, true_b = true_b, true_p = true_p,
+                              compiled_model = stan_model_compiled,
+                              future.seed = TRUE)
+
+end_time <- Sys.time()
+cat("Verified simulation complete. Time:", round(end_time - start_time, 2), "seconds\n")
+
+# Process results
+final_results_df <- do.call(rbind, results_list)
+valid_results <- final_results_df[final_results_df$valid_bayes == TRUE, ]
+
+cat(sprintf("Valid Bayesian results: %d out of %d (%.1f%%)\n", 
+            nrow(valid_results), nrow(final_results_df), 
+            100 * nrow(valid_results) / nrow(final_results_df)))
+
+if (nrow(valid_results) >= 20) {
+  
+  summary_a <- data.frame(
+    Metric = c("Bias", "AbsBias", "MSE", "Coverage", "Width"),
+    MLE = c(
+      mean(valid_results$mle_a - true_a, na.rm = TRUE),
+      mean(abs(valid_results$mle_a - true_a), na.rm = TRUE),
+      mean((valid_results$mle_a - true_a)^2, na.rm = TRUE),
+      mean(valid_results$mle_cov_a, na.rm = TRUE),
+      mean(valid_results$mle_width_a, na.rm = TRUE)
+    ),
+    Bayes = c(
+      mean(valid_results$bayes_a - true_a, na.rm = TRUE),
+      mean(abs(valid_results$bayes_a - true_a), na.rm = TRUE),
+      mean((valid_results$bayes_a - true_a)^2, na.rm = TRUE),
+      mean(valid_results$bayes_cov_a, na.rm = TRUE),
+      mean(valid_results$bayes_width_a, na.rm = TRUE)
+    )
+  )
+  
+  summary_b <- data.frame(
+    Metric = c("Bias", "AbsBias", "MSE", "Coverage", "Width"),
+    MLE = c(
+      mean(valid_results$mle_b - true_b, na.rm = TRUE),
+      mean(abs(valid_results$mle_b - true_b), na.rm = TRUE),
+      mean((valid_results$mle_b - true_b)^2, na.rm = TRUE),
+      mean(valid_results$mle_cov_b, na.rm = TRUE),
+      mean(valid_results$mle_width_b, na.rm = TRUE)
+    ),
+    Bayes = c(
+      mean(valid_results$bayes_b - true_b, na.rm = TRUE),
+      mean(abs(valid_results$bayes_b - true_b), na.rm = TRUE),
+      mean((valid_results$bayes_b - true_b)^2, na.rm = TRUE),
+      mean(valid_results$bayes_cov_b, na.rm = TRUE),
+      mean(valid_results$bayes_width_b, na.rm = TRUE)
+    )
+  )
+  
+  cat("\n=== VERIFIED SIMULATION RESULTS ===\n")
+  cat("--- Parameter 'a' ---\n")
+  print(summary_a, row.names = FALSE, digits = 4)
+  cat("\n--- Parameter 'b' ---\n")
+  print(summary_b, row.names = FALSE, digits = 4)
+  
+  cat("\n--- SUCCESS INDICATORS ---\n")
+  if (summary_a$Bayes[3] < summary_a$MLE[3]) cat("✓ Bayesian MSE better for parameter 'a'\n")
+  if (summary_b$Bayes[3] < summary_b$MLE[3]) cat("✓ Bayesian MSE better for parameter 'b'\n")
+  if (summary_a$Bayes[2] < summary_a$MLE[2]) cat("✓ Bayesian absolute bias better for parameter 'a'\n")
+  if (summary_b$Bayes[2] < summary_b$MLE[2]) cat("✓ Bayesian absolute bias better for parameter 'b'\n")
+  if (summary_a$Bayes[4] > 0.9) cat("✓ Good Bayesian coverage for parameter 'a'\n")
+  if (summary_b$Bayes[4] > 0.9) cat("✓ Good Bayesian coverage for parameter 'b'\n")
+  
+  cat("\n--- Diagnostics ---\n")
+  cat("Average divergences:", round(mean(valid_results$divergences, na.rm = TRUE), 1), "\n")
+  cat("Adaptation rate:", round(100 * mean(valid_results$adapted, na.rm = TRUE), 1), "%\n")
+  
+} else {
+  cat("Insufficient successful results. Check implementation.\n")
+}
+
+cat("\n=== VERIFIED SIMULATION COMPLETE ===\n")
+cat("This implementation uses consistent Dagum functions throughout.\n")
+cat("If results are still problematic, the issue may be with the progressive censoring scheme or parameter values.\n")
+```
+
+
+
+### n = 150, r = 90
+```{r}
+### Working Solution: Create Our Own Verified Dagum Implementation
+library(future)
+library(future.apply)
+library(rstan)
+library(optimx)
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+### 1. Create Our Own Verified Dagum Functions
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+# Dagum PDF: f(x; a, b, p) = (a*p/x^(p+1)) * b^p / (1 + (x/b)^(-p))^(a+1)
+dagum_pdf <- function(x, a, b, p) {
+  if (any(x <= 0) || a <= 0 || b <= 0 || p <= 0) return(rep(0, length(x)))
+  
+  term1 <- a * p
+  term2 <- x^(-(p + 1))
+  term3 <- b^p
+  term4 <- (1 + (x/b)^(-p))^(-(a + 1))
+  
+  return(term1 * term2 * term3 * term4)
+}
+
+# Dagum CDF: F(x; a, b, p) = 1 - (1 + (x/b)^(-p))^(-a)
+dagum_cdf <- function(x, a, b, p) {
+  if (any(x <= 0) || a <= 0 || b <= 0 || p <= 0) return(rep(0, length(x)))
+  
+  return(1 - (1 + (x/b)^(-p))^(-a))
+}
+
+# Dagum random generation using inverse transform
+dagum_random <- function(n, a, b, p) {
+  if (a <= 0 || b <= 0 || p <= 0) stop("Parameters must be positive")
+  
+  u <- runif(n)
+  # Inverse CDF: x = b * ((1-u)^(-1/a) - 1)^(-1/p)
+  x <- b * ((1 - u)^(-1/a) - 1)^(-1/p)
+  
+  return(x)
+}
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+### 2. Verify Our Implementation Works
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+verify_our_implementation <- function() {
+  cat("=== VERIFYING OUR DAGUM IMPLEMENTATION ===\n")
+  
+  # Test parameters
+  a <- 2.5; b <- 1.5; p <- 1.2
+  
+  # Generate test data
+  set.seed(123)
+  test_data <- dagum_random(n = 1000, a = a, b = b, p = p)
+  
+  cat("Generated data summary: min=", round(min(test_data), 3), 
+      ", mean=", round(mean(test_data), 3), 
+      ", max=", round(max(test_data), 3), "\n")
+  
+  # Test parameter recovery
+  our_negloglik <- function(par, data) {
+    if (any(par <= 0)) return(1e20)
+    pdf_vals <- dagum_pdf(data, par[1], par[2], p)
+    if (any(pdf_vals <= 0)) return(1e20)
+    return(-sum(log(pdf_vals)))
+  }
+  
+  recovery_fit <- optimx(par = c(1, 1), fn = our_negloglik, data = test_data,
+                        method = "nlminb", lower = c(0.1, 0.1), upper = c(10, 10))
+  
+  if (recovery_fit$convcode == 0) {
+    recovered_a <- recovery_fit$p1
+    recovered_b <- recovery_fit$p2
+    
+    cat("Parameter recovery test:\n")
+    cat("True:      a =", a, ", b =", b, "\n")
+    cat("Recovered: a =", round(recovered_a, 3), ", b =", round(recovered_b, 3), "\n")
+    
+    success_a <- abs(recovered_a - a) < 0.2
+    success_b <- abs(recovered_b - b) < 0.2
+    
+    cat("Recovery successful: a =", success_a, ", b =", success_b, "\n")
+    
+    if (success_a && success_b) {
+      cat("*** OUR IMPLEMENTATION WORKS! ***\n")
+      return(TRUE)
+    }
+  }
+  
+  cat("Parameter recovery failed\n")
+  return(FALSE)
+}
+
+# Test our implementation
+implementation_works <- verify_our_implementation()
+
+if (!implementation_works) {
+  stop("Our Dagum implementation doesn't work properly. Check the mathematical formulation.")
+}
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+### 3. Progressive Censoring Likelihood with Our Functions
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+negloglik_progressive_censored_verified <- function(par, data, R, p_fixed) {
+  a <- par[1]; b <- par[2]
+  if (a <= 0 || b <= 0 || !is.finite(a) || !is.finite(b)) return(1e20)
+  
+  # Log-likelihood from observed failures
+  pdf_vals <- dagum_pdf(data, a, b, p_fixed)
+  if (any(pdf_vals <= 0) || any(!is.finite(pdf_vals))) return(1e20)
+  ll_failures <- sum(log(pdf_vals))
+  
+  # Log-likelihood from censored observations
+  if (sum(R) > 0) {
+    cdf_vals <- dagum_cdf(data, a, b, p_fixed)
+    survival_vals <- 1 - cdf_vals
+    if (any(survival_vals <= 0) || any(!is.finite(survival_vals))) return(1e20)
+    ll_censored <- sum(R * log(survival_vals))
+  } else {
+    ll_censored <- 0
+  }
+  
+  return(-(ll_failures + ll_censored))
+}
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+### 4. Verified Stan Model
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+verified_stan_code <- '
+functions {
+  real dagum_lpdf(real x, real a, real b, real p) {
+    if (x <= 0) return negative_infinity();
+    
+    real log_pdf = log(a) + log(p) - (p + 1) * log(x) + p * log(b) - (a + 1) * log1p(pow(x/b, -p));
+    return log_pdf;
+  }
+  
+  real dagum_lccdf(real x, real a, real b, real p) {
+    if (x <= 0) return 0;
+    
+    return -a * log1p(pow(x/b, -p));
+  }
+}
+
+data {
+  int<lower=0> N_obs;
+  vector<lower=0>[N_obs] y_obs;
+  int<lower=0> R[N_obs];
+  real<lower=0> p;
+}
+
+parameters {
+  real<lower=0> a;
+  real<lower=0> b;
+}
+
+model {
+  // Weakly informative priors
+  a ~ gamma(2, 1);  // mean = 2, variance = 2
+  b ~ gamma(2, 1);  // mean = 2, variance = 2
+  
+  // Likelihood
+  for (i in 1:N_obs) {
+    target += dagum_lpdf(y_obs[i] | a, b, p);
+  }
+  
+  for (i in 1:N_obs) {
+    if (R[i] > 0) {
+      target += R[i] * dagum_lccdf(y_obs[i] | a, b, p);
+    }
+  }
+}
+'
+
+writeLines(verified_stan_code, "dagum_verified.stan")
+
+# Compile Stan model
+cat("Compiling verified Stan model...\n")
+stan_model_compiled <- rstan::stan_model("dagum_verified.stan")
+cat("Stan model compiled successfully!\n")
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+### 5. Working Simulation Function
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+run_verified_simulation <- function(sim_id, n_total, r, R_planned, T_ideal, true_a, true_b, true_p, compiled_model) {
+  
+  set.seed(100 + sim_id)
+  
+  # Generate data using OUR verified function
+  y_full <- sort(dagum_random(n = n_total, a = true_a, b = true_b, p = true_p))
+  
+  y_obs <- numeric(r)
+  R_final <- R_planned
+  current_n <- n_total
+  full_data_idx <- 1
+  adapted <- FALSE
+  
+  # Adaptive progressive censoring
+  for (i in 1:r) {
+    y_obs[i] <- y_full[full_data_idx]
+    
+    if (!adapted && y_obs[i] > T_ideal) {
+      adapted <- TRUE
+      removed_so_far <- if (i > 1) sum(R_final[1:(i-1)]) else 0
+      if (i < r) {
+        R_final[i:r] <- 0
+      }
+      R_final[r] <- n_total - r - removed_so_far
+    }
+    
+    n_removed_this_step <- 1 + R_final[i]
+    full_data_idx <- full_data_idx + n_removed_this_step
+    current_n <- current_n - n_removed_this_step
+  }
+  
+  y <- pmax(y_obs, 1e-6)
+  
+  results <- data.frame(
+    mle_a = NA, mle_b = NA, bayes_a = NA, bayes_b = NA,
+    mle_cov_a = NA, mle_cov_b = NA, bayes_cov_a = NA, bayes_cov_b = NA,
+    mle_width_a = NA, mle_width_b = NA, bayes_width_a = NA, bayes_width_b = NA,
+    mle_time = NA, bayes_time = NA, adapted = adapted,
+    divergences = NA, valid_bayes = FALSE
+  )
+
+  # MLE estimation using verified likelihood
+  mle_start_time <- Sys.time()
+  
+  # Multiple starting points for robustness
+  start_points <- list(c(1, 1), c(2, mean(y)), c(true_a*0.8, true_b*0.8))
+  
+  best_mle <- NULL
+  best_nll <- Inf
+  
+  for (start_par in start_points) {
+    mle_fit <- try(optimx(par = start_par, 
+                          fn = negloglik_progressive_censored_verified,
+                          data = y, R = R_final, p_fixed = true_p,
+                          method = "nlminb", lower = c(0.1, 0.1), upper = c(10, 10)), silent = TRUE)
+    
+    if (!inherits(mle_fit, "try-error") && mle_fit$convcode == 0 && mle_fit$value < best_nll) {
+      best_mle <- mle_fit
+      best_nll <- mle_fit$value
+    }
+  }
+  
+  results$mle_time <- as.numeric(difftime(Sys.time(), mle_start_time, units = "secs"))
+  
+  if (!is.null(best_mle)) {
+    results$mle_a <- best_mle$p1
+    results$mle_b <- best_mle$p2
+    
+    # Bootstrap confidence intervals (more reliable than Hessian)
+    bootstrap_cis <- try({
+      n_boot <- 200
+      boot_results <- matrix(NA, n_boot, 2)
+      
+      for (b in 1:n_boot) {
+        # Bootstrap sample
+        boot_indices <- sample(length(y), replace = TRUE)
+        boot_y <- y[boot_indices]
+        boot_R <- R_final[boot_indices]
+        
+        boot_fit <- try(optimx(par = c(results$mle_a, results$mle_b),
+                               fn = negloglik_progressive_censored_verified,
+                               data = boot_y, R = boot_R, p_fixed = true_p,
+                               method = "nlminb", lower = c(0.1, 0.1), upper = c(10, 10)), silent = TRUE)
+        
+        if (!inherits(boot_fit, "try-error") && boot_fit$convcode == 0) {
+          boot_results[b, ] <- c(boot_fit$p1, boot_fit$p2)
+        }
+      }
+      
+      # Remove failed bootstrap samples
+      valid_boots <- complete.cases(boot_results)
+      if (sum(valid_boots) >= 50) {
+        boot_results <- boot_results[valid_boots, ]
+        
+        ci_a <- quantile(boot_results[, 1], c(0.025, 0.975), na.rm = TRUE)
+        ci_b <- quantile(boot_results[, 2], c(0.025, 0.975), na.rm = TRUE)
+        
+        list(ci_a = ci_a, ci_b = ci_b)
+      } else {
+        NULL
+      }
+    }, silent = TRUE)
+    
+    if (!inherits(bootstrap_cis, "try-error") && !is.null(bootstrap_cis)) {
+      results$mle_width_a <- bootstrap_cis$ci_a[2] - bootstrap_cis$ci_a[1]
+      results$mle_width_b <- bootstrap_cis$ci_b[2] - bootstrap_cis$ci_b[1]
+      results$mle_cov_a <- (true_a >= bootstrap_cis$ci_a[1] && true_a <= bootstrap_cis$ci_a[2])
+      results$mle_cov_b <- (true_b >= bootstrap_cis$ci_b[1] && true_b <= bootstrap_cis$ci_b[2])
+    }
+  }
+
+  # Bayesian estimation
+  bayes_start_time <- Sys.time()
+  stan_data <- list(N_obs = length(y), y_obs = y, R = R_final, p = true_p)
+  
+  stan_fit <- try(rstan::sampling(
+    object = compiled_model,
+    data = stan_data,
+    chains = 4, iter = 2000, warmup = 1000,
+    verbose = FALSE, refresh = 0,
+    control = list(adapt_delta = 0.95)
+  ), silent = TRUE)
+  
+  results$bayes_time <- as.numeric(difftime(Sys.time(), bayes_start_time, units = "secs"))
+  
+  if (!inherits(stan_fit, "try-error")) {
+    sampler_params <- get_sampler_params(stan_fit, inc_warmup = FALSE)
+    divergences <- sum(sapply(sampler_params, function(x) sum(x[, "divergent__"])))
+    results$divergences <- divergences
+    
+    summary_stats <- rstan::summary(stan_fit)$summary
+    rhats <- summary_stats[, "Rhat"]
+    
+    if (all(rhats < 1.1, na.rm = TRUE) && divergences <= 10) {
+      results$valid_bayes <- TRUE
+      results$bayes_a <- summary_stats["a", "mean"]
+      results$bayes_b <- summary_stats["b", "mean"]
+      
+      results$bayes_width_a <- summary_stats["a", "97.5%"] - summary_stats["a", "2.5%"]
+      results$bayes_width_b <- summary_stats["b", "97.5%"] - summary_stats["b", "2.5%"]
+      results$bayes_cov_a <- (true_a >= summary_stats["a", "2.5%"] && true_a <= summary_stats["a", "97.5%"])
+      results$bayes_cov_b <- (true_b >= summary_stats["b", "2.5%"] && true_b <= summary_stats["b", "97.5%"])
+    }
+  }
+  
+  return(results)
+}
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+### 6. Run the Verified Simulation
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+# Simulation parameters
+n_sim <- 1000
+n_total <- 150
+r <- 90
+true_a <- 2.5
+true_b <- 1.5
+true_p <- 1.2
+T_ideal <- 2.0
+R_planned <- c(rep(0, r - 1), n_total - r)
+
+plan(multisession)
+
+cat("Starting VERIFIED simulation with consistent Dagum implementation...\n")
+start_time <- Sys.time()
+
+results_list <- future_lapply(1:n_sim, FUN = run_verified_simulation,
+                              n_total = n_total, r = r, R_planned = R_planned, T_ideal = T_ideal,
+                              true_a = true_a, true_b = true_b, true_p = true_p,
+                              compiled_model = stan_model_compiled,
+                              future.seed = TRUE)
+
+end_time <- Sys.time()
+cat("Verified simulation complete. Time:", round(end_time - start_time, 2), "seconds\n")
+
+# Process results
+final_results_df <- do.call(rbind, results_list)
+valid_results <- final_results_df[final_results_df$valid_bayes == TRUE, ]
+
+cat(sprintf("Valid Bayesian results: %d out of %d (%.1f%%)\n", 
+            nrow(valid_results), nrow(final_results_df), 
+            100 * nrow(valid_results) / nrow(final_results_df)))
+
+if (nrow(valid_results) >= 20) {
+  
+  summary_a <- data.frame(
+    Metric = c("Bias", "AbsBias", "MSE", "Coverage", "Width"),
+    MLE = c(
+      mean(valid_results$mle_a - true_a, na.rm = TRUE),
+      mean(abs(valid_results$mle_a - true_a), na.rm = TRUE),
+      mean((valid_results$mle_a - true_a)^2, na.rm = TRUE),
+      mean(valid_results$mle_cov_a, na.rm = TRUE),
+      mean(valid_results$mle_width_a, na.rm = TRUE)
+    ),
+    Bayes = c(
+      mean(valid_results$bayes_a - true_a, na.rm = TRUE),
+      mean(abs(valid_results$bayes_a - true_a), na.rm = TRUE),
+      mean((valid_results$bayes_a - true_a)^2, na.rm = TRUE),
+      mean(valid_results$bayes_cov_a, na.rm = TRUE),
+      mean(valid_results$bayes_width_a, na.rm = TRUE)
+    )
+  )
+  
+  summary_b <- data.frame(
+    Metric = c("Bias", "AbsBias", "MSE", "Coverage", "Width"),
+    MLE = c(
+      mean(valid_results$mle_b - true_b, na.rm = TRUE),
+      mean(abs(valid_results$mle_b - true_b), na.rm = TRUE),
+      mean((valid_results$mle_b - true_b)^2, na.rm = TRUE),
+      mean(valid_results$mle_cov_b, na.rm = TRUE),
+      mean(valid_results$mle_width_b, na.rm = TRUE)
+    ),
+    Bayes = c(
+      mean(valid_results$bayes_b - true_b, na.rm = TRUE),
+      mean(abs(valid_results$bayes_b - true_b), na.rm = TRUE),
+      mean((valid_results$bayes_b - true_b)^2, na.rm = TRUE),
+      mean(valid_results$bayes_cov_b, na.rm = TRUE),
+      mean(valid_results$bayes_width_b, na.rm = TRUE)
+    )
+  )
+  
+  cat("\n=== VERIFIED SIMULATION RESULTS ===\n")
+  cat("--- Parameter 'a' ---\n")
+  print(summary_a, row.names = FALSE, digits = 4)
+  cat("\n--- Parameter 'b' ---\n")
+  print(summary_b, row.names = FALSE, digits = 4)
+  
+  cat("\n--- SUCCESS INDICATORS ---\n")
+  if (summary_a$Bayes[3] < summary_a$MLE[3]) cat("✓ Bayesian MSE better for parameter 'a'\n")
+  if (summary_b$Bayes[3] < summary_b$MLE[3]) cat("✓ Bayesian MSE better for parameter 'b'\n")
+  if (summary_a$Bayes[2] < summary_a$MLE[2]) cat("✓ Bayesian absolute bias better for parameter 'a'\n")
+  if (summary_b$Bayes[2] < summary_b$MLE[2]) cat("✓ Bayesian absolute bias better for parameter 'b'\n")
+  if (summary_a$Bayes[4] > 0.9) cat("✓ Good Bayesian coverage for parameter 'a'\n")
+  if (summary_b$Bayes[4] > 0.9) cat("✓ Good Bayesian coverage for parameter 'b'\n")
+  
+  cat("\n--- Diagnostics ---\n")
+  cat("Average divergences:", round(mean(valid_results$divergences, na.rm = TRUE), 1), "\n")
+  cat("Adaptation rate:", round(100 * mean(valid_results$adapted, na.rm = TRUE), 1), "%\n")
+  
+} else {
+  cat("Insufficient successful results. Check implementation.\n")
+}
+
+cat("\n=== VERIFIED SIMULATION COMPLETE ===\n")
+cat("This implementation uses consistent Dagum functions throughout.\n")
+cat("If results are still problematic, the issue may be with the progressive censoring scheme or parameter values.\n")
+```
+
+
+
+### n = 100, r = 80
+```{r}
+### Working Solution: Create Our Own Verified Dagum Implementation
+library(future)
+library(future.apply)
+library(rstan)
+library(optimx)
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+### 1. Create Our Own Verified Dagum Functions
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+# Dagum PDF: f(x; a, b, p) = (a*p/x^(p+1)) * b^p / (1 + (x/b)^(-p))^(a+1)
+dagum_pdf <- function(x, a, b, p) {
+  if (any(x <= 0) || a <= 0 || b <= 0 || p <= 0) return(rep(0, length(x)))
+  
+  term1 <- a * p
+  term2 <- x^(-(p + 1))
+  term3 <- b^p
+  term4 <- (1 + (x/b)^(-p))^(-(a + 1))
+  
+  return(term1 * term2 * term3 * term4)
+}
+
+# Dagum CDF: F(x; a, b, p) = 1 - (1 + (x/b)^(-p))^(-a)
+dagum_cdf <- function(x, a, b, p) {
+  if (any(x <= 0) || a <= 0 || b <= 0 || p <= 0) return(rep(0, length(x)))
+  
+  return(1 - (1 + (x/b)^(-p))^(-a))
+}
+
+# Dagum random generation using inverse transform
+dagum_random <- function(n, a, b, p) {
+  if (a <= 0 || b <= 0 || p <= 0) stop("Parameters must be positive")
+  
+  u <- runif(n)
+  # Inverse CDF: x = b * ((1-u)^(-1/a) - 1)^(-1/p)
+  x <- b * ((1 - u)^(-1/a) - 1)^(-1/p)
+  
+  return(x)
+}
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+### 2. Verify Our Implementation Works
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+verify_our_implementation <- function() {
+  cat("=== VERIFYING OUR DAGUM IMPLEMENTATION ===\n")
+  
+  # Test parameters
+  a <- 2.5; b <- 1.5; p <- 1.2
+  
+  # Generate test data
+  set.seed(123)
+  test_data <- dagum_random(n = 1000, a = a, b = b, p = p)
+  
+  cat("Generated data summary: min=", round(min(test_data), 3), 
+      ", mean=", round(mean(test_data), 3), 
+      ", max=", round(max(test_data), 3), "\n")
+  
+  # Test parameter recovery
+  our_negloglik <- function(par, data) {
+    if (any(par <= 0)) return(1e20)
+    pdf_vals <- dagum_pdf(data, par[1], par[2], p)
+    if (any(pdf_vals <= 0)) return(1e20)
+    return(-sum(log(pdf_vals)))
+  }
+  
+  recovery_fit <- optimx(par = c(1, 1), fn = our_negloglik, data = test_data,
+                        method = "nlminb", lower = c(0.1, 0.1), upper = c(10, 10))
+  
+  if (recovery_fit$convcode == 0) {
+    recovered_a <- recovery_fit$p1
+    recovered_b <- recovery_fit$p2
+    
+    cat("Parameter recovery test:\n")
+    cat("True:      a =", a, ", b =", b, "\n")
+    cat("Recovered: a =", round(recovered_a, 3), ", b =", round(recovered_b, 3), "\n")
+    
+    success_a <- abs(recovered_a - a) < 0.2
+    success_b <- abs(recovered_b - b) < 0.2
+    
+    cat("Recovery successful: a =", success_a, ", b =", success_b, "\n")
+    
+    if (success_a && success_b) {
+      cat("*** OUR IMPLEMENTATION WORKS! ***\n")
+      return(TRUE)
+    }
+  }
+  
+  cat("Parameter recovery failed\n")
+  return(FALSE)
+}
+
+# Test our implementation
+implementation_works <- verify_our_implementation()
+
+if (!implementation_works) {
+  stop("Our Dagum implementation doesn't work properly. Check the mathematical formulation.")
+}
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+### 3. Progressive Censoring Likelihood with Our Functions
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+negloglik_progressive_censored_verified <- function(par, data, R, p_fixed) {
+  a <- par[1]; b <- par[2]
+  if (a <= 0 || b <= 0 || !is.finite(a) || !is.finite(b)) return(1e20)
+  
+  # Log-likelihood from observed failures
+  pdf_vals <- dagum_pdf(data, a, b, p_fixed)
+  if (any(pdf_vals <= 0) || any(!is.finite(pdf_vals))) return(1e20)
+  ll_failures <- sum(log(pdf_vals))
+  
+  # Log-likelihood from censored observations
+  if (sum(R) > 0) {
+    cdf_vals <- dagum_cdf(data, a, b, p_fixed)
+    survival_vals <- 1 - cdf_vals
+    if (any(survival_vals <= 0) || any(!is.finite(survival_vals))) return(1e20)
+    ll_censored <- sum(R * log(survival_vals))
+  } else {
+    ll_censored <- 0
+  }
+  
+  return(-(ll_failures + ll_censored))
+}
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+### 4. Verified Stan Model
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+verified_stan_code <- '
+functions {
+  real dagum_lpdf(real x, real a, real b, real p) {
+    if (x <= 0) return negative_infinity();
+    
+    real log_pdf = log(a) + log(p) - (p + 1) * log(x) + p * log(b) - (a + 1) * log1p(pow(x/b, -p));
+    return log_pdf;
+  }
+  
+  real dagum_lccdf(real x, real a, real b, real p) {
+    if (x <= 0) return 0;
+    
+    return -a * log1p(pow(x/b, -p));
+  }
+}
+
+data {
+  int<lower=0> N_obs;
+  vector<lower=0>[N_obs] y_obs;
+  int<lower=0> R[N_obs];
+  real<lower=0> p;
+}
+
+parameters {
+  real<lower=0> a;
+  real<lower=0> b;
+}
+
+model {
+  // Weakly informative priors
+  a ~ gamma(2, 1);  // mean = 2, variance = 2
+  b ~ gamma(2, 1);  // mean = 2, variance = 2
+  
+  // Likelihood
+  for (i in 1:N_obs) {
+    target += dagum_lpdf(y_obs[i] | a, b, p);
+  }
+  
+  for (i in 1:N_obs) {
+    if (R[i] > 0) {
+      target += R[i] * dagum_lccdf(y_obs[i] | a, b, p);
+    }
+  }
+}
+'
+
+writeLines(verified_stan_code, "dagum_verified.stan")
+
+# Compile Stan model
+cat("Compiling verified Stan model...\n")
+stan_model_compiled <- rstan::stan_model("dagum_verified.stan")
+cat("Stan model compiled successfully!\n")
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+### 5. Working Simulation Function
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+run_verified_simulation <- function(sim_id, n_total, r, R_planned, T_ideal, true_a, true_b, true_p, compiled_model) {
+  
+  set.seed(100 + sim_id)
+  
+  # Generate data using OUR verified function
+  y_full <- sort(dagum_random(n = n_total, a = true_a, b = true_b, p = true_p))
+  
+  y_obs <- numeric(r)
+  R_final <- R_planned
+  current_n <- n_total
+  full_data_idx <- 1
+  adapted <- FALSE
+  
+  # Adaptive progressive censoring
+  for (i in 1:r) {
+    y_obs[i] <- y_full[full_data_idx]
+    
+    if (!adapted && y_obs[i] > T_ideal) {
+      adapted <- TRUE
+      removed_so_far <- if (i > 1) sum(R_final[1:(i-1)]) else 0
+      if (i < r) {
+        R_final[i:r] <- 0
+      }
+      R_final[r] <- n_total - r - removed_so_far
+    }
+    
+    n_removed_this_step <- 1 + R_final[i]
+    full_data_idx <- full_data_idx + n_removed_this_step
+    current_n <- current_n - n_removed_this_step
+  }
+  
+  y <- pmax(y_obs, 1e-6)
+  
+  results <- data.frame(
+    mle_a = NA, mle_b = NA, bayes_a = NA, bayes_b = NA,
+    mle_cov_a = NA, mle_cov_b = NA, bayes_cov_a = NA, bayes_cov_b = NA,
+    mle_width_a = NA, mle_width_b = NA, bayes_width_a = NA, bayes_width_b = NA,
+    mle_time = NA, bayes_time = NA, adapted = adapted,
+    divergences = NA, valid_bayes = FALSE
+  )
+
+  # MLE estimation using verified likelihood
+  mle_start_time <- Sys.time()
+  
+  # Multiple starting points for robustness
+  start_points <- list(c(1, 1), c(2, mean(y)), c(true_a*0.8, true_b*0.8))
+  
+  best_mle <- NULL
+  best_nll <- Inf
+  
+  for (start_par in start_points) {
+    mle_fit <- try(optimx(par = start_par, 
+                          fn = negloglik_progressive_censored_verified,
+                          data = y, R = R_final, p_fixed = true_p,
+                          method = "nlminb", lower = c(0.1, 0.1), upper = c(10, 10)), silent = TRUE)
+    
+    if (!inherits(mle_fit, "try-error") && mle_fit$convcode == 0 && mle_fit$value < best_nll) {
+      best_mle <- mle_fit
+      best_nll <- mle_fit$value
+    }
+  }
+  
+  results$mle_time <- as.numeric(difftime(Sys.time(), mle_start_time, units = "secs"))
+  
+  if (!is.null(best_mle)) {
+    results$mle_a <- best_mle$p1
+    results$mle_b <- best_mle$p2
+    
+    # Bootstrap confidence intervals (more reliable than Hessian)
+    bootstrap_cis <- try({
+      n_boot <- 200
+      boot_results <- matrix(NA, n_boot, 2)
+      
+      for (b in 1:n_boot) {
+        # Bootstrap sample
+        boot_indices <- sample(length(y), replace = TRUE)
+        boot_y <- y[boot_indices]
+        boot_R <- R_final[boot_indices]
+        
+        boot_fit <- try(optimx(par = c(results$mle_a, results$mle_b),
+                               fn = negloglik_progressive_censored_verified,
+                               data = boot_y, R = boot_R, p_fixed = true_p,
+                               method = "nlminb", lower = c(0.1, 0.1), upper = c(10, 10)), silent = TRUE)
+        
+        if (!inherits(boot_fit, "try-error") && boot_fit$convcode == 0) {
+          boot_results[b, ] <- c(boot_fit$p1, boot_fit$p2)
+        }
+      }
+      
+      # Remove failed bootstrap samples
+      valid_boots <- complete.cases(boot_results)
+      if (sum(valid_boots) >= 50) {
+        boot_results <- boot_results[valid_boots, ]
+        
+        ci_a <- quantile(boot_results[, 1], c(0.025, 0.975), na.rm = TRUE)
+        ci_b <- quantile(boot_results[, 2], c(0.025, 0.975), na.rm = TRUE)
+        
+        list(ci_a = ci_a, ci_b = ci_b)
+      } else {
+        NULL
+      }
+    }, silent = TRUE)
+    
+    if (!inherits(bootstrap_cis, "try-error") && !is.null(bootstrap_cis)) {
+      results$mle_width_a <- bootstrap_cis$ci_a[2] - bootstrap_cis$ci_a[1]
+      results$mle_width_b <- bootstrap_cis$ci_b[2] - bootstrap_cis$ci_b[1]
+      results$mle_cov_a <- (true_a >= bootstrap_cis$ci_a[1] && true_a <= bootstrap_cis$ci_a[2])
+      results$mle_cov_b <- (true_b >= bootstrap_cis$ci_b[1] && true_b <= bootstrap_cis$ci_b[2])
+    }
+  }
+
+  # Bayesian estimation
+  bayes_start_time <- Sys.time()
+  stan_data <- list(N_obs = length(y), y_obs = y, R = R_final, p = true_p)
+  
+  stan_fit <- try(rstan::sampling(
+    object = compiled_model,
+    data = stan_data,
+    chains = 4, iter = 2000, warmup = 1000,
+    verbose = FALSE, refresh = 0,
+    control = list(adapt_delta = 0.95)
+  ), silent = TRUE)
+  
+  results$bayes_time <- as.numeric(difftime(Sys.time(), bayes_start_time, units = "secs"))
+  
+  if (!inherits(stan_fit, "try-error")) {
+    sampler_params <- get_sampler_params(stan_fit, inc_warmup = FALSE)
+    divergences <- sum(sapply(sampler_params, function(x) sum(x[, "divergent__"])))
+    results$divergences <- divergences
+    
+    summary_stats <- rstan::summary(stan_fit)$summary
+    rhats <- summary_stats[, "Rhat"]
+    
+    if (all(rhats < 1.1, na.rm = TRUE) && divergences <= 10) {
+      results$valid_bayes <- TRUE
+      results$bayes_a <- summary_stats["a", "mean"]
+      results$bayes_b <- summary_stats["b", "mean"]
+      
+      results$bayes_width_a <- summary_stats["a", "97.5%"] - summary_stats["a", "2.5%"]
+      results$bayes_width_b <- summary_stats["b", "97.5%"] - summary_stats["b", "2.5%"]
+      results$bayes_cov_a <- (true_a >= summary_stats["a", "2.5%"] && true_a <= summary_stats["a", "97.5%"])
+      results$bayes_cov_b <- (true_b >= summary_stats["b", "2.5%"] && true_b <= summary_stats["b", "97.5%"])
+    }
+  }
+  
+  return(results)
+}
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+### 6. Run the Verified Simulation
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+# Simulation parameters
+n_sim <- 1000
+n_total <- 100
+r <- 80
+true_a <- 2.5
+true_b <- 1.5
+true_p <- 1.2
+T_ideal <- 2.0
+R_planned <- c(rep(0, r - 1), n_total - r)
+
+plan(multisession)
+
+cat("Starting VERIFIED simulation with consistent Dagum implementation...\n")
+start_time <- Sys.time()
+
+results_list <- future_lapply(1:n_sim, FUN = run_verified_simulation,
+                              n_total = n_total, r = r, R_planned = R_planned, T_ideal = T_ideal,
+                              true_a = true_a, true_b = true_b, true_p = true_p,
+                              compiled_model = stan_model_compiled,
+                              future.seed = TRUE)
+
+end_time <- Sys.time()
+cat("Verified simulation complete. Time:", round(end_time - start_time, 2), "seconds\n")
+
+# Process results
+final_results_df <- do.call(rbind, results_list)
+valid_results <- final_results_df[final_results_df$valid_bayes == TRUE, ]
+
+cat(sprintf("Valid Bayesian results: %d out of %d (%.1f%%)\n", 
+            nrow(valid_results), nrow(final_results_df), 
+            100 * nrow(valid_results) / nrow(final_results_df)))
+
+if (nrow(valid_results) >= 20) {
+  
+  summary_a <- data.frame(
+    Metric = c("Bias", "AbsBias", "MSE", "Coverage", "Width"),
+    MLE = c(
+      mean(valid_results$mle_a - true_a, na.rm = TRUE),
+      mean(abs(valid_results$mle_a - true_a), na.rm = TRUE),
+      mean((valid_results$mle_a - true_a)^2, na.rm = TRUE),
+      mean(valid_results$mle_cov_a, na.rm = TRUE),
+      mean(valid_results$mle_width_a, na.rm = TRUE)
+    ),
+    Bayes = c(
+      mean(valid_results$bayes_a - true_a, na.rm = TRUE),
+      mean(abs(valid_results$bayes_a - true_a), na.rm = TRUE),
+      mean((valid_results$bayes_a - true_a)^2, na.rm = TRUE),
+      mean(valid_results$bayes_cov_a, na.rm = TRUE),
+      mean(valid_results$bayes_width_a, na.rm = TRUE)
+    )
+  )
+  
+  summary_b <- data.frame(
+    Metric = c("Bias", "AbsBias", "MSE", "Coverage", "Width"),
+    MLE = c(
+      mean(valid_results$mle_b - true_b, na.rm = TRUE),
+      mean(abs(valid_results$mle_b - true_b), na.rm = TRUE),
+      mean((valid_results$mle_b - true_b)^2, na.rm = TRUE),
+      mean(valid_results$mle_cov_b, na.rm = TRUE),
+      mean(valid_results$mle_width_b, na.rm = TRUE)
+    ),
+    Bayes = c(
+      mean(valid_results$bayes_b - true_b, na.rm = TRUE),
+      mean(abs(valid_results$bayes_b - true_b), na.rm = TRUE),
+      mean((valid_results$bayes_b - true_b)^2, na.rm = TRUE),
+      mean(valid_results$bayes_cov_b, na.rm = TRUE),
+      mean(valid_results$bayes_width_b, na.rm = TRUE)
+    )
+  )
+  
+  cat("\n=== VERIFIED SIMULATION RESULTS ===\n")
+  cat("--- Parameter 'a' ---\n")
+  print(summary_a, row.names = FALSE, digits = 4)
+  cat("\n--- Parameter 'b' ---\n")
+  print(summary_b, row.names = FALSE, digits = 4)
+  
+  cat("\n--- SUCCESS INDICATORS ---\n")
+  if (summary_a$Bayes[3] < summary_a$MLE[3]) cat("✓ Bayesian MSE better for parameter 'a'\n")
+  if (summary_b$Bayes[3] < summary_b$MLE[3]) cat("✓ Bayesian MSE better for parameter 'b'\n")
+  if (summary_a$Bayes[2] < summary_a$MLE[2]) cat("✓ Bayesian absolute bias better for parameter 'a'\n")
+  if (summary_b$Bayes[2] < summary_b$MLE[2]) cat("✓ Bayesian absolute bias better for parameter 'b'\n")
+  if (summary_a$Bayes[4] > 0.9) cat("✓ Good Bayesian coverage for parameter 'a'\n")
+  if (summary_b$Bayes[4] > 0.9) cat("✓ Good Bayesian coverage for parameter 'b'\n")
+  
+  cat("\n--- Diagnostics ---\n")
+  cat("Average divergences:", round(mean(valid_results$divergences, na.rm = TRUE), 1), "\n")
+  cat("Adaptation rate:", round(100 * mean(valid_results$adapted, na.rm = TRUE), 1), "%\n")
+  
+} else {
+  cat("Insufficient successful results. Check implementation.\n")
+}
+
+cat("\n=== VERIFIED SIMULATION COMPLETE ===\n")
+cat("This implementation uses consistent Dagum functions throughout.\n")
+cat("If results are still problematic, the issue may be with the progressive censoring scheme or parameter values.\n")
+```
+
+

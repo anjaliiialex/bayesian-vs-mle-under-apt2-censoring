@@ -1,0 +1,119 @@
+---
+title: "final simulation with p fixed and bayes for mle optimx"
+author: "Anjali Alex"
+date: "2025-08-16"
+output: html_document
+---
+
+### 1. Load the libraries
+```{r}
+library(rjags)
+library(coda)
+library(actuar) 
+library(VGAM)
+library(optimx)
+```
+
+### 2. Define the MLE function
+```{r}
+negloglik_dagum_p_fixed <- function(par, data, p_fixed) {
+  a <- par[1]
+  b <- par[2]
+  if (a <= 0 || b <= 0 || !is.finite(a) || !is.finite(b)) return(1e20)
+  -sum(actuar::ddagum(x = data, shape1.a = a, scale = b, shape2.p = p_fixed, log = TRUE))
+}
+```
+
+### 3. Simulation settings
+```{r}
+n_sim <- 100
+n_total <- 100
+r <- 60
+true_a <- 2.5
+true_b <- 1.5
+true_p <- 1.2
+```
+
+### 4. Setup storage
+```{r}
+mle_results <- matrix(NA, nrow = n_sim, ncol = 3)
+bayes_results <- matrix(NA, nrow = n_sim, ncol = 3)
+colnames(mle_results) <- colnames(bayes_results) <- c("a", "b", "p")
+```
+
+### 5. Simulation Loop
+```{r}
+for (sim in 1:n_sim) {
+  cat("Running simulation:", sim, "/", n_sim, "\n")
+  set.seed(100 + sim)
+  
+  y_full <- sort(VGAM::rdagum(n = n_total, scale = true_b, shape1.a = true_a, shape2.p = true_p))
+  failures <- y_full[1:r]
+  y <- ifelse(failures <= 0, 1e-6, failures)
+  N <- length(y)
+
+  # --- STAGE 1: BAYESIAN ESTIMATION (To get robust starting values) ---
+  bayes_success <- FALSE
+  jags_data <- list(y = y, N = N, p = true_p, zeros = rep(0, N))
+  post_means_vec <- try({
+    model <- jags.model("dagum_model_p_fixed.txt", data = jags_data, n.chains = 2, n.adapt = 2000, quiet = TRUE)
+    update(model, 2000)
+    samples <- coda.samples(model, variable.names = c("a", "b"), n.iter = 5000)
+    if (gelman.diag(samples)$mpsrf < 1.1) {
+      bayes_success <- TRUE
+      colMeans(as.matrix(samples))
+    } else { NA }
+  }, silent = TRUE)
+  
+  if (bayes_success) {
+    bayes_results[sim, ] <- c(post_means_vec, true_p)
+  }
+  
+  # --- STAGE 2: MLE ESTIMATION (Using optimx with Bayesian start) ---
+  if (bayes_success) {
+    mle_fit_results <- try(optimx(
+      par = post_means_vec, # Using the intelligent starting point
+      fn = negloglik_dagum_p_fixed,
+      data = y,
+      p_fixed = true_p,
+      method = c("nlminb", "L-BFGS-B"),
+      lower = c(1e-5, 1e-5)
+    ), silent = TRUE)
+    
+    if (!inherits(mle_fit_results, "try-error")) {
+      successful_runs <- subset(mle_fit_results, convcode == 0)
+      if (nrow(successful_runs) > 0) {
+        best_run <- successful_runs[which.min(successful_runs$value), ]
+        mle_results[sim, ] <- c(best_run$p1, best_run$p2, true_p)
+      }
+    }
+  }
+}
+```
+
+### 6. Calculation and printing of results
+```{r}
+mle_results_clean <- na.omit(mle_results)
+bayes_results_clean <- na.omit(bayes_results)
+
+cat("\nNumber of successful MLE fits:", nrow(mle_results_clean), "/", n_sim, "\n")
+cat("Number of successful Bayes fits:", nrow(bayes_results_clean), "/", n_sim, "\n\n")
+
+compute_bias_mse <- function(estimates, true_vals) {
+  bias <- colMeans(estimates) - true_vals
+  mse <- colMeans((t(t(estimates) - true_vals))^2)
+  return(list(bias = bias, mse = mse))
+}
+
+true_vals <- c("a" = true_a, "b" = true_b, "p" = true_p)
+
+# We only calculate bias/mse for the estimated parameters 'a' and 'b'
+mle_metrics <- compute_bias_mse(mle_results_clean[, 1:2], true_vals[1:2])
+bayes_metrics <- compute_bias_mse(bayes_results_clean[, 1:2], true_vals[1:2])
+
+cat("== Bias (for a, b) ==\nMLE:\n"); print(mle_metrics$bias)
+cat("\nBayesian:\n"); print(bayes_metrics$bias)
+cat("\n== MSE (for a, b) ==\nMLE:\n"); print(mle_metrics$mse)
+cat("\nBayesian:\n"); print(bayes_metrics$mse)
+```
+

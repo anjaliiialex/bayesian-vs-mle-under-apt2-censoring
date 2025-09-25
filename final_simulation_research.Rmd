@@ -1,0 +1,142 @@
+---
+title: "Final Simulation"
+author: "Anjali Alex"
+date: "2025-07-28"
+output: html_document
+---
+
+### Load Required Libraries
+```{r setup, message=FALSE, warning=FALSE}
+# Load required packages
+library(rjags)
+library(coda)
+library(actuar)      # For Dagum distribution and MLE
+library(fitdistrplus)  # MLE fitting
+library(ggplot2)
+library(gridExtra)
+```
+
+### Define Dagum PDF and Random Generation
+```{r}
+# Set seed
+set.seed(123)
+
+# Generate Dagum-distributed data
+true_a <- 2.5
+true_b <- 1.5
+true_p <- 1.2
+
+n_total <- 100
+dagum_data <- rdagum(n_total, true_a, true_p,  true_b)
+y_full <- sort(dagum_data)
+```
+
+### Censoring Function
+```{r}
+# Simulate Adaptive Progressive Type-II Censoring
+r <- 60  # number of observed failures
+failures <- y_full[1:r]
+censoring_scheme <- sample(0:(n_total - r), r, replace = TRUE)
+
+# Final data used for modeling
+y <- failures
+N <- length(y)
+y <- ifelse(y <= 0, 0.001, y)  # Prevent log(0)
+
+```
+
+### Define JAGS model for Dagum
+```{r}
+# JAGS data list
+jags_data <- list(
+  y = y,
+  N = N,
+  zeros = rep(0, N)
+)
+
+# JAGS model with zeros trick
+dagum_model_string <- "
+model {
+  for (i in 1:N) {
+    zeros[i] ~ dpois(phi[i])
+    phi[i] <- -loglik[i] + 10000
+    loglik[i] <- log(a * p / b) + (a * p - 1) * log(y[i] / b) -
+                 (p + 1) * log(1 + pow(y[i] / b, a))
+  }
+
+  a ~ dgamma(2, 1)T(0.001, )
+  b ~ dgamma(2, 1)T(0.001, )
+  p ~ dgamma(2, 1)T(0.001, )
+}
+"
+writeLines(dagum_model_string, con = "dagum_model.txt")
+
+# Run JAGS
+model <- jags.model("dagum_model.txt", data = jags_data, n.chains = 2, n.adapt = 1000)
+update(model, 2000)
+samples <- coda.samples(model, variable.names = c("a", "b", "p"), n.iter = 5000)
+
+```
+
+### Posterior Samples
+```{r}
+# Extract and summarize posterior samples
+summary_samples <- summary(samples)
+posterior_df <- as.data.frame(do.call(rbind, samples))
+
+# Plot posterior distributions
+plot_posterior <- function(param) {
+  ggplot(posterior_df, aes_string(x = param)) +
+    geom_density(fill = "skyblue", alpha = 0.6) +
+    geom_vline(xintercept = get(paste0("true_", param)), col = "red", linetype = "dashed") +
+    labs(title = paste("Posterior of", param),
+         x = param, y = "Density") +
+    theme_minimal()
+}
+
+p1 <- plot_posterior("a")
+p2 <- plot_posterior("b")
+p3 <- plot_posterior("p")
+
+grid.arrange(p1, p2, p3, ncol = 3)
+```
+
+
+### MLE Function
+```{r}
+negloglik_dagum <- function(par, data) {
+  a <- par[1]; b <- par[2]; p <- par[3]
+  if (a <= 0 || b <= 0 || p <= 0) return(1e10)
+  loglik <- sum(log(ddagum(data, a, p, b)))
+  if (!is.finite(loglik)) return(1e10)
+  return(-loglik)
+}
+
+# Perform MLE with bounds
+opt_result <- optim(
+  par = c(2, 2, 2),
+  fn = negloglik_dagum,
+  data = y,
+  method = "L-BFGS-B",
+  lower = c(1e-5, 1e-5, 1e-5),
+  upper = c(Inf, Inf, Inf)
+)
+
+opt_result$par  # Estimated parameters
+
+# Extract MLE estimates
+mle_estimates <- opt_result$par
+names(mle_estimates) <- c("a", "b", "p") 
+
+```
+### Comparison of obtained values
+```{r}
+# Print comparison
+cat("True values:\n")
+print(c(a = true_a, b = true_b, p = true_p))
+cat("\nBayesian posterior means:\n")
+print(summary_samples$statistics[,"Mean"])
+cat("\nMLE estimates:\n")
+print(mle_estimates)
+```
+

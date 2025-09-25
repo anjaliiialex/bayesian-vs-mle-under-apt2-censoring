@@ -1,0 +1,57 @@
+---
+title: "demo for bayes jags"
+author: "Anjali Alex"
+date: "2025-09-19"
+output: html_document
+---
+
+```{r}
+### SINGLE TEST SCRIPT FOR BAYESIAN MODEL ###
+
+# --- Load Libraries ---
+library(rjags)
+library(VGAM)
+
+# --- Settings ---
+n_total <- 100
+r <- 60
+true_a <- 2.5
+true_b <- 1.5
+true_p <- 1.2
+
+# --- Generate One Dataset ---
+set.seed(101) # Use a fixed seed for a reproducible test
+y_full <- sort(VGAM::rdagum(n = n_total, scale = true_b, shape1.a = true_a, shape2.p = true_p))
+failures <- y_full[1:r]
+y <- ifelse(failures <= 0, 1e-6, failures)
+N <- length(y)
+cat("--- Data Generated for Test ---\n")
+
+# --- Prepare Data for JAGS ---
+# This must match the data list in your main script
+jags_data <- list(y = y, N = N, p = true_p,
+                  n_cens = n_total - r, T_c = y[r],
+                  zeros = rep(0, N),
+                  censor_zero = 0)
+cat("--- jags_data List Created ---\n")
+
+# --- Attempt to Run the JAGS model (No 'try()' to hide errors) ---
+cat("--- Attempting to Compile the JAGS Model ---\n")
+
+# This is the critical line that will show us the real error
+jags_model <- rjags::jags.model(
+  "dagum_model_censored.txt",
+  data = jags_data,
+  n.chains = 2,
+  n.adapt = 1000,
+  quiet = FALSE  # Set to FALSE to see more messages
+)
+
+cat("--- Model Compiled Successfully ---\n")
+
+# If it gets this far, we try to run it
+update(jags_model, 1000)
+
+cat("--- Model Ran Successfully! ---\n")
+```
+

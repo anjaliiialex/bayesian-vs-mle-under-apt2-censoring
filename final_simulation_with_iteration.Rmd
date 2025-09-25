@@ -1,0 +1,138 @@
+---
+title: "Final Simulation with Iteration"
+author: "Anjali Alex"
+date: "2025-08-05"
+output: html_document
+---
+
+### Necessary libraries and packages
+```{r setup, message=FALSE, warning=FALSE}
+library(rjags)
+library(coda)
+library(actuar)      # For Dagum distribution and MLE
+library(fitdistrplus)  # MLE fitting
+library(ggplot2)
+library(gridExtra)
+library(VGAM)
+```
+
+### Define Negative Log-Likelihood Function for MLE
+```{r}
+negloglik_dagum <- function(par, data) {
+  a <- par[1]
+  b <- par[2]
+  p <- par[3]
+  
+  # Check for invalid parameters to prevent errors
+  if (a <= 0 || b <= 0 || p <= 0) {
+    return(Inf) # Return a large value if parameters are out of bounds
+  }
+  
+  # Calculate the sum of negative log-likelihoods
+  # Using log = TRUE is numerically more stable than log(ddagum(...))
+  -sum(actuar::ddagum(x = data, shape1.a = a, scale = b, shape2.p = p, log = TRUE))
+}
+```
+
+
+### Simulation Settings
+```{r}
+n_sim <- 100
+n_total <- 100
+r <- 60
+true_a <- 2.5
+true_b <- 1.5
+true_p <- 1.2
+```
+
+### Storage for estimates
+```{r}
+mle_results <- matrix(NA, nrow = n_sim, ncol = 3)
+bayes_results <- matrix(NA, nrow = n_sim, ncol = 3)
+colnames(mle_results) <- colnames(bayes_results) <- c("a", "b", "p")
+```
+
+### Simulation Loop
+```{r}
+for (sim in 1:n_sim) {
+  cat("Running simulation:", sim, "/", n_sim, "\n")
+  set.seed(100 + sim)
+  
+  y_full <- sort(rdagum(n_total, true_a, true_b, true_p))
+  
+  # Type-II Censoring: Keep the first 'r' failures
+  failures <- y_full[1:r]
+  
+  # Ensure data is positive for log-likelihood calculations
+  y <- ifelse(failures <= 0, 1e-6, failures)
+  N <- length(y)
+}
+```
+
+### MLE Estimation
+```{r}
+mle_fit <- try(
+    optim(
+      par = c(2, 2, 2),        # Initial guesses for a, b, p
+      fn = negloglik_dagum,   # The function to minimize
+      data = y,
+      method = "L-BFGS-B",
+      lower = c(1e-5, 1e-5, 1e-5) # Parameters must be positive
+    ),
+    silent = TRUE
+  )
+  
+  if (!inherits(mle_fit, "try-error") && mle_fit$convergence == 0) {
+    mle_results[sim, ] <- mle_fit$par
+  } else {
+    mle_results[sim, ] <- c(NA, NA, NA) # Mark as NA if optimization failed
+  }
+```
+
+### Bayesian Estimation via JAGS
+```{r}
+jags_data <- list(y = y, N = N, zeros = rep(0, N))
+  
+  # Use a try-catch for the Bayesian model as well, in case of issues
+  post_means <- try({
+    model <- jags.model("dagum_model.txt", data = jags_data, n.chains = 2, n.adapt = 1000, quiet = TRUE)
+    update(model, 1000) # Burn-in
+    samples <- coda.samples(model, variable.names = c("a", "b", "p"), n.iter = 2000)
+    colMeans(as.matrix(samples))
+  }, silent = TRUE)
+  
+  if (!inherits(post_means, "try-error")) {
+    bayes_results[sim, ] <- post_means
+  } else {
+    bayes_results[sim, ] <- c(NA, NA, NA) # Mark as NA if JAGS failed
+  }
+
+```
+
+### Bias and MSE Calculations
+```{r}
+# Remove rows with NAs before calculating metrics
+mle_results_clean <- na.omit(mle_results)
+bayes_results_clean <- na.omit(bayes_results)
+
+cat("\nNumber of successful MLE fits:", nrow(mle_results_clean), "/", n_sim, "\n")
+cat("Number of successful Bayes fits:", nrow(bayes_results_clean), "/", n_sim, "\n\n")
+
+compute_bias_mse <- function(estimates, true_vals) {
+  bias <- colMeans(estimates) - true_vals
+  mse <- colMeans((t(t(estimates) - true_vals))^2)
+  return(list(bias = bias, mse = mse))
+}
+
+true_vals <- c("a" = true_a, "b" = true_b, "p" = true_p)
+
+mle_metrics <- compute_bias_mse(mle_results_clean, true_vals)
+bayes_metrics <- compute_bias_mse(bayes_results_clean, true_vals)
+
+cat("== Bias ==\nMLE:\n"); print(mle_metrics$bias)
+cat("\nBayesian:\n"); print(bayes_metrics$bias)
+
+cat("\n== MSE ==\nMLE:\n"); print(mle_metrics$mse)
+cat("\nBayesian:\n"); print(bayes_metrics$mse)
+```
+

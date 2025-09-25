@@ -1,0 +1,127 @@
+---
+title: "research demo"
+author: "Anjali Alex"
+date: "2025-08-19"
+output: html_document
+---
+
+```{r}
+# Load package for Dagum distribution (in VGAM package)
+if(!require(VGAM)) install.packages("VGAM")
+library(VGAM)
+
+# Parameters
+a <- 2   # shape parameter a
+p <- 3   # shape parameter p
+b_values <- c(0.5, 1, 2, 3)  # scale parameter values
+
+# Define PDF of Dagum distribution
+ddagum_custom <- function(x, a, b, p) {
+  (a * p / x) * ((x / b)^(a * p)) / ((1 + (x / b)^a)^(p + 1))
+}
+
+# Save plot as PNG
+png("dagum_pdf_plot.png", width = 800, height = 600)
+
+# Plot setup
+x <- seq(0.01, 10, length.out = 500)  # avoid 0 since pdf undefined at x=0
+plot(x, ddagum_custom(x, a, b_values[1], p), type = "l", lwd = 2,
+     ylim = c(0, 2), col = 1,
+     xlab = "t", ylab = "f(t)",
+     main = paste("Dagum PDF with a =", a, "and p =", p))
+
+# Add other curves for different b values
+cols <- c("blue", "red", "green", "purple")
+for(i in seq_along(b_values)) {
+  lines(x, ddagum_custom(x, a, b_values[i], p), col = cols[i], lwd = 2)
+}
+
+# Add grid lines
+grid(nx = NULL, ny = NULL, col = "gray", lty = "dotted")
+
+# Legend
+legend("topright", legend = paste("b =", b_values),
+       col = cols, lwd = 2)
+
+dev.off()   # Close the PNG device
+
+```
+
+
+```{r}
+# Parameters
+a <- 2   # shape parameter a
+p <- 3   # shape parameter p
+b_values <- c(0.5, 1, 2, 3)  # scale parameter values from earlier example
+
+# Survival function of Dagum distribution
+sdagum_custom <- function(x, a, b, p) {
+  (1 + (x / b)^a)^(-p)
+}
+
+# Save plot as PNG
+png("dagum_survival_plot.png", width = 800, height = 600)
+
+# Plot setup
+x <- seq(0, 15, length.out = 500)  
+plot(x, sdagum_custom(x, a, b_values[1], p), type = "l", lwd = 2,
+     ylim = c(0, 1), col = 1,
+     xlab = "t", ylab = "S(t)",
+     main = paste("Dagum Survival Functions with a =", a, "and p =", p))
+
+# Add other curves for different b values
+cols <- c("blue", "red", "green", "purple")
+for(i in seq_along(b_values)) {
+  lines(x, sdagum_custom(x, a, b_values[i], p), col = cols[i], lwd = 2)
+}
+
+# Add grid lines
+grid(nx = NULL, ny = NULL, col = "gray", lty = "dotted")
+
+# Legend
+legend("topright", legend = paste("b =", b_values),
+       col = cols, lwd = 2)
+
+dev.off()   # Close the PNG device
+
+```
+
+```{r}
+# Parameters
+a <- 2   # shape parameter a
+p <- 3   # shape parameter p
+b_values <- c(0.5, 1, 2, 3)  # scale parameter values
+
+# Hazard function of Dagum distribution
+hdagum_custom <- function(x, a, b, p) {
+  (a * p / x) * ((x / b)^(a * p)) / (1 + (x / b)^a)
+}
+
+# Save plot as PNG
+png("dagum_hazard_plot.png", width = 800, height = 600)
+
+# Plot setup
+x <- seq(0.01, 15, length.out = 500)  # start at 0.01 to avoid division by 0
+plot(x, hdagum_custom(x, a, b_values[1], p), type = "l", lwd = 2,
+     ylim = c(0, 2), col = 1,
+     xlab = "t", ylab = "h(t)",
+     main = paste("Dagum Hazard Functions with a =", a, "and p =", p))
+
+# Add other curves for different b values
+cols <- c("blue", "red", "green", "purple")
+for(i in seq_along(b_values)) {
+  lines(x, hdagum_custom(x, a, b_values[i], p), col = cols[i], lwd = 2)
+}
+
+# Add grid lines
+grid(nx = NULL, ny = NULL, col = "gray", lty = "dotted")
+
+# Legend
+legend("topright", legend = paste("b =", b_values),
+       col = cols, lwd = 2)
+
+dev.off()   # Close the PNG device
+
+
+```
+

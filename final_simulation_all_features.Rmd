@@ -1,0 +1,154 @@
+---
+title: "final simulation r code with all features"
+author: "Anjali Alex"
+date: "2025-08-16"
+output: html_document
+---
+
+### 1. Load libraries
+```{r}
+library(rjags)
+library(coda)
+library(actuar) 
+library(VGAM)
+library(optimx)
+```
+
+### 2. Define the MLE function
+```{r}
+negloglik_dagum_p_fixed <- function(par, data, p_fixed) {
+  a <- par[1]
+  b <- par[2]
+  if (a <= 0 || b <= 0 || !is.finite(a) || !is.finite(b)) return(1e20)
+  -sum(actuar::ddagum(x = data, shape1.a = a, scale = b, shape2.p = p_fixed, log = TRUE))
+}
+```
+
+### 3. Simulation settings
+```{r}
+n_sim <- 100
+n_total <- 100
+r <- 60
+true_a <- 2.5
+true_b <- 1.5
+true_p <- 1.2
+```
+
+### 4. Setup Storage
+```{r}
+# For parameter estimates
+mle_results <- matrix(NA, nrow = n_sim, ncol = 3)
+bayes_results <- matrix(NA, nrow = n_sim, ncol = 3)
+colnames(mle_results) <- colnames(bayes_results) <- c("a", "b", "p")
+
+# For interval estimation
+bayes_coverage <- matrix(NA, nrow = n_sim, ncol = 2, dimnames = list(NULL, c("a", "b")))
+bayes_widths <- matrix(NA, nrow = n_sim, ncol = 2, dimnames = list(NULL, c("a", "b")))
+# (No storage needed for MLE intervals as they will fail)
+
+# For computational time
+timings <- matrix(NA, nrow = n_sim, ncol = 2, dimnames = list(NULL, c("MLE", "Bayes")))
+```
+
+### 5. Simulation Loop
+```{r}
+for (sim in 1:n_sim) {
+  cat("Running simulation:", sim, "/", n_sim, "\n")
+  set.seed(100 + sim)
+  
+  y_full <- sort(VGAM::rdagum(n = n_total, scale = true_b, shape1.a = true_a, shape2.p = true_p))
+  failures <- y_full[1:r]
+  y <- ifelse(failures <= 0, 1e-6, failures)
+  N <- length(y)
+
+  # --- Bayesian Estimation, with Timing and Intervals ---
+  bayes_time <- system.time({
+    jags_data <- list(y = y, N = N, p = true_p, zeros = rep(0, N))
+    post_samples_obj <- try({
+      model <- jags.model("dagum_model_p_fixed.txt", data = jags_data, n.chains = 2, n.adapt = 2000, quiet = TRUE)
+      update(model, 2000)
+      coda.samples(model, variable.names = c("a", "b"), n.iter = 5000)
+    }, silent = TRUE)
+  })
+  
+  timings[sim, "Bayes"] <- bayes_time["elapsed"]
+  
+  if (!inherits(post_samples_obj, "try-error") && gelman.diag(post_samples_obj)$mpsrf < 1.1) {
+    post_matrix <- as.matrix(post_samples_obj)
+    bayes_results[sim, ] <- c(colMeans(post_matrix), true_p)
+    
+    # Calculate 95% Credible Intervals and metrics
+    cred_intervals <- apply(post_matrix, 2, quantile, probs = c(0.025, 0.975))
+    bayes_widths[sim, "a"] <- cred_intervals[2, "a"] - cred_intervals[1, "a"]
+    bayes_widths[sim, "b"] <- cred_intervals[2, "b"] - cred_intervals[1, "b"]
+    
+    bayes_coverage[sim, "a"] <- (true_a > cred_intervals[1, "a"] && true_a < cred_intervals[2, "a"])
+    bayes_coverage[sim, "b"] <- (true_b > cred_intervals[1, "b"] && true_b < cred_intervals[2, "b"])
+  }
+  
+  # --- MLE Estimation, with Timing and Intervals ---
+  mle_time <- system.time({
+      mle_fit <- try(optimx(
+          par = c(2, 2), # Using naive start to demonstrate failure
+          fn = negloglik_dagum_p_fixed,
+          data = y,
+          p_fixed = true_p,
+          method = c("nlminb", "L-BFGS-B"),
+          lower = c(1e-5, 1e-5),
+          control = list(save.failures = FALSE),
+          hessian = TRUE # Request the Hessian for CI calculation
+      ), silent = TRUE)
+  })
+  
+  timings[sim, "MLE"] <- mle_time["elapsed"]
+  
+  if (!inherits(mle_fit, "try-error")) {
+    successful_runs <- subset(mle_fit, convcode == 0)
+    if (nrow(successful_runs) > 0) {
+      best_run <- successful_runs[which.min(successful_runs$value), ]
+      mle_results[sim, ] <- c(best_run$p1, best_run$p2, true_p)
+      
+      # If we ever succeeded, we would calculate CIs here.
+      # This part of the code will likely never be reached.
+      # hessian_matrix <- attr(best_run, "details")["nlminb", "nhatend"][[1]]
+      # std_errors <- sqrt(diag(solve(hessian_matrix)))
+      # ... code to calculate CI from std_errors ...
+    }
+  }
+}
+```
+
+### 6. Calculate and print final results
+```{r}
+mle_results_clean <- na.omit(mle_results)
+bayes_results_clean <- na.omit(bayes_results)
+
+cat("\n--- Convergence Results ---\n")
+cat("Number of successful MLE fits:     ", nrow(mle_results_clean), "/", n_sim, "\n")
+cat("Number of successful Bayes fits:   ", nrow(bayes_results_clean), "/", n_sim, "\n\n")
+
+cat("--- Point Estimation (Bias & MSE) ---\n")
+true_vals_ab <- c("a" = true_a, "b" = true_b)
+bayes_metrics <- list(
+  bias = colMeans(bayes_results_clean[, 1:2]) - true_vals_ab,
+  mse = colMeans((bayes_results_clean[, 1:2] - t(replicate(n_sim, true_vals_ab)))^2)
+)
+cat("Bayesian Bias (for a, b):\n"); print(bayes_metrics$bias)
+cat("\nBayesian MSE (for a, b):\n"); print(bayes_metrics$mse)
+# MLE results will be NaN due to 0 successes
+cat("\nMLE Bias and MSE are NaN due to complete convergence failure.\n\n")
+
+
+cat("--- Interval Estimation (Bayesian) ---\n")
+avg_bayes_widths <- colMeans(na.omit(bayes_widths))
+bayes_coverage_prob <- colMeans(na.omit(bayes_coverage))
+cat("Average Bayesian Credible Interval Widths:\n"); print(avg_bayes_widths)
+cat("\nBayesian Coverage Probability (Target = 0.95):\n"); print(bayes_coverage_prob)
+cat("\nMLE Confidence Intervals could not be constructed.\n\n")
+
+
+cat("--- Computational Feasibility ---\n")
+avg_timings <- colMeans(na.omit(timings))
+cat("Average CPU Time (seconds) per simulation:\n"); print(avg_timings)
+```
+

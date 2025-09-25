@@ -1,0 +1,749 @@
+---
+title: "Simulation Code with Changes"
+author: "Anjali Alex"
+date: "2025-09-19"
+output: html_document
+---
+
+
+```{r}
+### 1. Load Libraries
+library(rjags)
+library(coda)
+library(VGAM)
+library(optimx)
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+### 2. Define Helper Function for MLE (using VGAM)
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+negloglik_dagum_censored <- function(par, data, n_total, r, p_fixed) {
+  a <- par[1]; b <- par[2]
+  if (a <= 0 || b <= 0 || !is.finite(a) || !is.finite(b)) return(1e20)
+  last_failure_time <- data[r]
+  loglik_failures <- sum(VGAM::ddagum(x = data, scale = b, shape1.a = a, shape2.p = p_fixed, log = TRUE))
+  loglik_censored <- (n_total - r) * VGAM::pdagum(q = last_failure_time, scale = b, shape1.a = a, shape2.p = p_fixed, lower.tail = FALSE, log.p = TRUE)
+  -1 * (loglik_failures + loglik_censored)
+}
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+### 3. Define the Main Simulation Function
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+run_one_simulation <- function(sim_id, n_total, r, true_a, true_b, true_p, n_sim) {
+  
+  cat("Running simulation:", sim_id, "/", n_sim, "...\n")
+  set.seed(100 + sim_id)
+  
+  y_full <- sort(VGAM::rdagum(n = n_total, scale = true_b, shape1.a = true_a, shape2.p = true_p))
+  failures <- y_full[1:r]
+  y <- ifelse(failures <= 0, 1e-6, failures)
+  N <- length(y)
+
+  results <- data.frame(mle_a=NA, mle_b=NA, bayes_a=NA, bayes_b=NA,
+                        mle_cov_a=NA, mle_cov_b=NA, bayes_cov_a=NA, bayes_cov_b=NA,
+                        mle_width_a=NA, mle_width_b=NA, bayes_width_a=NA, bayes_width_b=NA,
+                        mle_time=NA, bayes_time=NA)
+
+  # --- Bayesian Estimation (with error printing enabled) ---
+  bayes_start_time <- Sys.time()
+  jags_data <- list(y = y, N = N, p = true_p,
+                    n_cens = n_total - r, T_c = y[r],
+                    zeros = rep(0, N), censor_zero = 0)
+                    
+  post_samples_obj <- try({
+    model <- rjags::jags.model("dagum_model_censored.txt",
+                               data = jags_data,
+                               n.chains = 2,
+                               n.adapt = 4000,
+                               quiet = TRUE)
+    rjags::update(model, 4000, quiet=TRUE)
+    rjags::coda.samples(model, variable.names=c("a", "b"), n.iter=10000)
+  }, silent = FALSE) # <-- CRITICAL CHANGE: This will now print the error message
+  
+  results$bayes_time <- as.numeric(difftime(Sys.time(), bayes_start_time, units="secs"))
+
+  if (!inherits(post_samples_obj, "try-error") && coda::gelman.diag(post_samples_obj)$mpsrf < 1.1) {
+    post_matrix <- as.matrix(post_samples_obj)
+    results$bayes_a <- mean(post_matrix[,"a"])
+    results$bayes_b <- mean(post_matrix[,"b"])
+    # ... rest of calculations
+  }
+
+  # --- MLE Estimation ---
+  mle_start_time <- Sys.time()
+  start_par <- c(true_a * runif(1, 0.8, 1.2), true_b * runif(1, 0.8, 1.2))
+  mle_fit <- try(optimx::optimx(par=start_par, fn=negloglik_dagum_censored, data=y, n_total=n_total, r=r, p_fixed=true_p,
+                                method=c("nlminb", "BFGS"), lower=c(1e-5, 1e-5), hessian=TRUE), silent=TRUE)
+  results$mle_time <- as.numeric(difftime(Sys.time(), mle_start_time, units="secs"))
+
+  if (!inherits(mle_fit, "try-error")) {
+    successful_runs <- subset(mle_fit, convcode==0)
+    if (nrow(successful_runs) > 0) {
+      best_run <- successful_runs[which.min(successful_runs$value),]
+      results$mle_a <- best_run$p1
+      results$mle_b <- best_run$p2
+      # ... rest of calculations
+    }
+  }
+  return(results)
+}
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+### 4. Main Script to Run Simulation
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+n_sim <- 10
+n_total <- 100
+r <- 60
+true_a <- 2.5
+true_b <- 1.5
+true_p <- 1.2
+
+cat("Starting", n_sim, "simulations sequentially...\n")
+start_time <- Sys.time()
+results_list <- lapply(1:n_sim, FUN = run_one_simulation,
+                       n_total=n_total, r=r, true_a=true_a, true_b=true_b, true_p=true_p,
+                       n_sim = n_sim)
+end_time <- Sys.time()
+cat("...simulations complete. Total time:", round(end_time - start_time, 2), "seconds\n")
+
+# --- Process and Summarize Results ---
+final_results_df <- do.call(rbind, results_list)
+
+# (The summary printing code remains the same)
+summary_a <- data.frame(
+  Metric = c("Bias", "MSE", "Coverage", "Width"),
+  MLE    = c(mean(final_results_df$mle_a - true_a, na.rm=TRUE),
+             mean((final_results_df$mle_a - true_a)^2, na.rm=TRUE),
+             mean(final_results_df$mle_cov_a, na.rm=TRUE),
+             mean(final_results_df$mle_width_a, na.rm=TRUE)),
+  Bayes  = c(mean(final_results_df$bayes_a - true_a, na.rm=TRUE),
+             mean((final_results_df$bayes_a - true_a)^2, na.rm=TRUE),
+             mean(final_results_df$bayes_cov_a, na.rm=TRUE),
+             mean(final_results_df$bayes_width_a, na.rm=TRUE))
+)
+summary_b <- data.frame(
+  Metric = c("Bias", "MSE", "Coverage", "Width"),
+  MLE    = c(mean(final_results_df$mle_b - true_b, na.rm=TRUE),
+             mean((final_results_df$mle_b - true_b)^2, na.rm=TRUE),
+             mean(final_results_df$mle_cov_b, na.rm=TRUE),
+             mean(final_results_df$mle_width_b, na.rm=TRUE)),
+  Bayes  = c(mean(final_results_df$bayes_b - true_b, na.rm=TRUE),
+             mean((final_results_df$bayes_b - true_b)^2, na.rm=TRUE),
+             mean(final_results_df$bayes_cov_b, na.rm=TRUE),
+             mean(final_results_df$bayes_width_b, na.rm=TRUE))
+)
+avg_times <- data.frame(
+  Method = c("MLE Time", "Bayes Time"),
+  Seconds = c(mean(final_results_df$mle_time, na.rm=TRUE),
+              mean(final_results_df$bayes_time, na.rm=TRUE))
+)
+cat("\n--- Summary Results for Parameter 'a' ---\n")
+print(summary_a, row.names=FALSE)
+cat("\n--- Summary Results for Parameter 'b' ---\n")
+print(summary_b, row.names=FALSE)
+cat("\n--- Average Computation Time ---\n")
+print(avg_times, row.names=FALSE)
+```
+
+
+```{r}
+### 1. Load Libraries
+library(rstan) # <-- NEW
+library(VGAM)
+library(optimx)
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+### 2. Define Helper Function for MLE (using VGAM)
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+negloglik_dagum_censored <- function(par, data, n_total, r, p_fixed) {
+  a <- par[1]; b <- par[2]
+  if (a <= 0 || b <= 0 || !is.finite(a) || !is.finite(b)) return(1e20)
+  last_failure_time <- data[r]
+  loglik_failures <- sum(VGAM::ddagum(x = data, scale = b, shape1.a = a, shape2.p = p_fixed, log = TRUE))
+  loglik_censored <- (n_total - r) * VGAM::pdagum(q = last_failure_time, scale = b, shape1.a = a, shape2.p = p_fixed, lower.tail = FALSE, log.p = TRUE)
+  -1 * (loglik_failures + loglik_censored)
+}
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+### 3. Define the Main Simulation Function
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+run_one_simulation <- function(sim_id, n_total, r, true_a, true_b, true_p, n_sim) {
+  
+  cat("Running simulation:", sim_id, "/", n_sim, "...\n")
+  set.seed(100 + sim_id)
+  
+  y_full <- sort(VGAM::rdagum(n = n_total, scale = true_b, shape1.a = true_a, shape2.p = true_p))
+  failures <- y_full[1:r]
+  y <- ifelse(failures <= 0, 1e-6, failures)
+  N <- length(y)
+
+  results <- data.frame(mle_a=NA, mle_b=NA, bayes_a=NA, bayes_b=NA,
+                        mle_cov_a=NA, mle_cov_b=NA, bayes_cov_a=NA, bayes_cov_b=NA,
+                        mle_width_a=NA, mle_width_b=NA, bayes_width_a=NA, bayes_width_b=NA,
+                        mle_time=NA, bayes_time=NA)
+
+  # --- Bayesian Estimation using Stan ---
+  bayes_start_time <- Sys.time()
+  stan_data <- list(N_obs = N,
+                    N_cens = n_total - r,
+                    y_obs = y,
+                    T_cens = y[r],
+                    p = true_p)
+                    
+  # Note: The first time you run this, it will take several minutes to compile the Stan model.
+  # Subsequent runs will be much faster.
+  stan_fit <- try(rstan::stan(file = "dagum_model.stan",
+                              data = stan_data,
+                              chains = 2, iter = 2500, warmup = 1000,
+                              verbose = FALSE, refresh = 0),
+                  silent = TRUE)
+  
+  results$bayes_time <- as.numeric(difftime(Sys.time(), bayes_start_time, units="secs"))
+
+  if (!inherits(stan_fit, "try-error")) {
+    post_matrix <- as.matrix(stan_fit)
+    # Check for convergence (Rhat)
+    summary_stats <- rstan::summary(stan_fit)$summary
+    rhats <- summary_stats[, "Rhat"]
+    if (all(rhats < 1.1, na.rm = TRUE)) {
+        results$bayes_a <- mean(post_matrix[,"a"])
+        results$bayes_b <- mean(post_matrix[,"b"])
+        cred_intervals <- summary_stats[c("a","b"), c("2.5%", "97.5%")]
+        results$bayes_width_a <- cred_intervals["a","97.5%"] - cred_intervals["a","2.5%"]
+        results$bayes_width_b <- cred_intervals["b","97.5%"] - cred_intervals["b","2.5%"]
+        results$bayes_cov_a <- (true_a > cred_intervals["a","2.5%"] && true_a < cred_intervals["a","97.5%"])
+        results$bayes_cov_b <- (true_b > cred_intervals["b","2.5%"] && true_b < cred_intervals["b","97.5%"])
+    }
+  }
+
+  # --- MLE Estimation ---
+  mle_start_time <- Sys.time()
+  start_par <- c(true_a * runif(1, 0.8, 1.2), true_b * runif(1, 0.8, 1.2))
+  mle_fit <- try(optimx::optimx(par=start_par, fn=negloglik_dagum_censored, data=y, n_total=n_total, r=r, p_fixed=true_p,
+                                method="nlminb", lower=c(1e-5, 1e-5), hessian=TRUE), silent=TRUE)
+  results$mle_time <- as.numeric(difftime(Sys.time(), mle_start_time, units="secs"))
+
+  if (!inherits(mle_fit, "try-error") && mle_fit$convcode == 0) {
+    results$mle_a <- mle_fit$p1
+    results$mle_b <- mle_fit$p2
+    hessian_matrix <- attr(mle_fit, "details")[["nlminb", "nhatend"]]
+      if (!is.null(hessian_matrix) && is.matrix(hessian_matrix)) {
+        fisher_info <- try(solve(hessian_matrix), silent=TRUE)
+        if (!inherits(fisher_info, "try-error") && all(diag(fisher_info) > 0)) {
+          std_errors <- sqrt(diag(fisher_info))
+          ci_a <- results$mle_a + c(-1,1) * 1.96 * std_errors[1]
+          ci_b <- results$mle_b + c(-1,1) * 1.96 * std_errors[2]
+          results$mle_width_a <- ci_a[2] - ci_a[1]
+          results$mle_width_b <- ci_b[2] - ci_b[1]
+          results$mle_cov_a <- (true_a > ci_a[1] && true_a < ci_a[2])
+          results$mle_cov_b <- (true_b > ci_b[1] && true_b < ci_b[2])
+        }
+      }
+  }
+  return(results)
+}
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+### 4. Main Script to Run Simulation
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+n_sim <- 1000
+n_total <- 100
+r <- 60
+true_a <- 2.5
+true_b <- 1.5
+true_p <- 1.2
+
+cat("Starting", n_sim, "simulations sequentially...\n")
+start_time <- Sys.time()
+results_list <- lapply(1:n_sim, FUN = run_one_simulation,
+                       n_total=n_total, r=r, true_a=true_a, true_b=true_b, true_p=true_p,
+                       n_sim = n_sim)
+end_time <- Sys.time()
+cat("...simulations complete. Total time:", round(end_time - start_time, 2), "seconds\n")
+
+# --- Process and Summarize Results ---
+final_results_df <- do.call(rbind, results_list)
+
+# (The summary printing code remains the same)
+summary_a <- data.frame(
+  Metric = c("Bias", "MSE", "Coverage", "Width"),
+  MLE    = c(mean(final_results_df$mle_a - true_a, na.rm=TRUE),
+             mean((final_results_df$mle_a - true_a)^2, na.rm=TRUE),
+             mean(final_results_df$mle_cov_a, na.rm=TRUE),
+             mean(final_results_df$mle_width_a, na.rm=TRUE)),
+  Bayes  = c(mean(final_results_df$bayes_a - true_a, na.rm=TRUE),
+             mean((final_results_df$bayes_a - true_a)^2, na.rm=TRUE),
+             mean(final_results_df$bayes_cov_a, na.rm=TRUE),
+             mean(final_results_df$bayes_width_a, na.rm=TRUE))
+)
+summary_b <- data.frame(
+  Metric = c("Bias", "MSE", "Coverage", "Width"),
+  MLE    = c(mean(final_results_df$mle_b - true_b, na.rm=TRUE),
+             mean((final_results_df$mle_b - true_b)^2, na.rm=TRUE),
+             mean(final_results_df$mle_cov_b, na.rm=TRUE),
+             mean(final_results_df$mle_width_b, na.rm=TRUE)),
+  Bayes  = c(mean(final_results_df$bayes_b - true_b, na.rm=TRUE),
+             mean((final_results_df$bayes_b - true_b)^2, na.rm=TRUE),
+             mean(final_results_df$bayes_cov_b, na.rm=TRUE),
+             mean(final_results_df$bayes_width_b, na.rm=TRUE))
+)
+avg_times <- data.frame(
+  Method = c("MLE Time", "Bayes Time"),
+  Seconds = c(mean(final_results_df$mle_time, na.rm=TRUE),
+              mean(final_results_df$bayes_time, na.rm=TRUE))
+)
+cat("\n--- Summary Results for Parameter 'a' ---\n")
+print(summary_a, row.names=FALSE)
+cat("\n--- Summary Results for Parameter 'b' ---\n")
+print(summary_b, row.names=FALSE)
+cat("\n--- Average Computation Time ---\n")
+print(avg_times, row.names=FALSE)
+```
+
+
+
+```{r}
+install.packages(c("future", "future.apply"))
+```
+
+### finalllll
+```{r}
+### 1. Load Libraries
+# You may need to run: install.packages(c("future", "future.apply", "rstan"))
+library(future)
+library(future.apply)
+library(rstan)
+library(VGAM)
+library(optimx)
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+### 2. Pre-compile the Stan Model (THE KEY SPEED IMPROVEMENT)
+# This reads and compiles the Stan model only ONCE at the start.
+# This can take a minute, but saves a lot of time in the loop.
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+cat("Pre-compiling the Stan model... (This may take a minute)\n")
+stan_model_compiled <- rstan::stan_model("dagum_model.stan")
+cat("...Stan model compiled.\n")
+
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+### 3. Define Helper & Main Simulation Functions
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+negloglik_dagum_censored <- function(par, data, n_total, r, p_fixed) {
+  a <- par[1]; b <- par[2]
+  if (a <= 0 || b <= 0 || !is.finite(a) || !is.finite(b)) return(1e20)
+  last_failure_time <- data[r]
+  loglik_failures <- sum(VGAM::ddagum(x = data, scale = b, shape1.a = a, shape2.p = p_fixed, log = TRUE))
+  loglik_censored <- (n_total - r) * VGAM::pdagum(q = last_failure_time, scale = b, shape1.a = a, shape2.p = p_fixed, lower.tail = FALSE, log.p = TRUE)
+  -1 * (loglik_failures + loglik_censored)
+}
+
+run_one_simulation <- function(sim_id, n_total, r, true_a, true_b, true_p, compiled_model) {
+  
+  set.seed(100 + sim_id)
+  
+  y_full <- sort(VGAM::rdagum(n = n_total, scale = true_b, shape1.a = true_a, shape2.p = true_p))
+  failures <- y_full[1:r]
+  y <- ifelse(failures <= 0, 1e-6, failures)
+  N <- length(y)
+
+  results <- data.frame(mle_a=NA, mle_b=NA, bayes_a=NA, bayes_b=NA,
+                        mle_cov_a=NA, mle_cov_b=NA, bayes_cov_a=NA, bayes_cov_b=NA,
+                        mle_width_a=NA, mle_width_b=NA, bayes_width_a=NA, bayes_width_b=NA,
+                        mle_time=NA, bayes_time=NA)
+
+  # --- Bayesian Estimation using the pre-compiled Stan model ---
+  bayes_start_time <- Sys.time()
+  stan_data <- list(N_obs = N, N_cens = n_total - r, y_obs = y, T_cens = y[r], p = true_p)
+  
+  stan_fit <- try(rstan::sampling(object = compiled_model,
+                                  data = stan_data,
+                                  chains = 2, iter = 2000, warmup = 1000,
+                                  verbose = FALSE, refresh = 0), silent = TRUE)
+  
+  results$bayes_time <- as.numeric(difftime(Sys.time(), bayes_start_time, units="secs"))
+  if (!inherits(stan_fit, "try-error")) {
+    summary_stats <- rstan::summary(stan_fit)$summary
+    rhats <- summary_stats[, "Rhat"]
+    if (all(rhats < 1.1, na.rm = TRUE)) {
+        results$bayes_a <- mean(as.matrix(stan_fit)[,"a"])
+        results$bayes_b <- mean(as.matrix(stan_fit)[,"b"])
+        cred_intervals <- summary_stats[c("a","b"), c("2.5%", "97.5%")]
+        results$bayes_width_a <- cred_intervals["a","97.5%"] - cred_intervals["a","2.5%"]
+        results$bayes_width_b <- cred_intervals["b","97.5%"] - cred_intervals["b","2.5%"]
+        results$bayes_cov_a <- (true_a > cred_intervals["a","2.5%"] && true_a < cred_intervals["a","97.5%"])
+        results$bayes_cov_b <- (true_b > cred_intervals["b","2.5%"] && true_b < cred_intervals["b","97.5%"])
+    }
+  }
+
+  # --- MLE Estimation ---
+  mle_start_time <- Sys.time()
+  start_par <- c(true_a * runif(1, 0.8, 1.2), true_b * runif(1, 0.8, 1.2))
+  mle_fit <- try(optimx::optimx(par=start_par, fn=negloglik_dagum_censored, data=y, n_total=n_total, r=r, p_fixed=true_p,
+                                method="nlminb", lower=c(1e-5, 1e-5), hessian=TRUE), silent=TRUE)
+  results$mle_time <- as.numeric(difftime(Sys.time(), mle_start_time, units="secs"))
+  if (!inherits(mle_fit, "try-error") && mle_fit$convcode == 0) {
+    results$mle_a <- mle_fit$p1
+    results$mle_b <- mle_fit$p2
+    hessian_matrix <- attr(mle_fit, "details")[["nlminb", "nhatend"]]
+      if (!is.null(hessian_matrix) && is.matrix(hessian_matrix)) {
+        fisher_info <- try(solve(hessian_matrix), silent=TRUE)
+        if (!inherits(fisher_info, "try-error") && all(diag(fisher_info) > 0)) {
+          std_errors <- sqrt(diag(fisher_info))
+          ci_a <- results$mle_a + c(-1,1) * 1.96 * std_errors[1]
+          ci_b <- results$mle_b + c(-1,1) * 1.96 * std_errors[2]
+          results$mle_width_a <- ci_a[2] - ci_a[1]
+          results$mle_width_b <- ci_b[2] - ci_b[1]
+          results$mle_cov_a <- (true_a > ci_a[1] && true_a < ci_a[2])
+          results$mle_cov_b <- (true_b > ci_b[1] && true_b < ci_b[2])
+        }
+      }
+  }
+  return(results)
+}
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+### 4. Main Script to Run Simulation (Fast & Crash-Proof)
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+n_sim <- 1000 
+n_total <- 100
+r <- 60
+true_a <- 2.5
+true_b <- 1.5
+true_p <- 1.2
+
+# This tells R to run each simulation in a new, clean R session.
+# This is both faster (uses multiple CPU cores) and crash-proof.
+plan(multisession)
+
+cat("Starting", n_sim, "simulations in parallel...\n")
+start_time <- Sys.time()
+
+# We use future_lapply, which has a progress bar and is crash-proof.
+# We pass the pre-compiled model object to the function.
+results_list <- future_lapply(1:n_sim, FUN = run_one_simulation,
+                              n_total=n_total, r=r, true_a=true_a, true_b=true_b, true_p=true_p,
+                              compiled_model = stan_model_compiled,
+                              future.seed = TRUE) # Ensures reproducibility
+
+end_time <- Sys.time()
+cat("...simulations complete. Total time:", round(end_time - start_time, 2), "seconds\n")
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+### 5. Process and Summarize Results
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+final_results_df <- do.call(rbind, results_list)
+
+summary_a <- data.frame(
+  Metric = c("Bias", "MSE", "Coverage", "Width"),
+  MLE    = c(mean(final_results_df$mle_a - true_a, na.rm=TRUE),
+             mean((final_results_df$mle_a - true_a)^2, na.rm=TRUE),
+             mean(final_results_df$mle_cov_a, na.rm=TRUE),
+             mean(final_results_df$mle_width_a, na.rm=TRUE)),
+  Bayes  = c(mean(final_results_df$bayes_a - true_a, na.rm=TRUE),
+             mean((final_results_df$bayes_a - true_a)^2, na.rm=TRUE),
+             mean(final_results_df$bayes_cov_a, na.rm=TRUE),
+             mean(final_results_df$bayes_width_a, na.rm=TRUE))
+)
+summary_b <- data.frame(
+  Metric = c("Bias", "MSE", "Coverage", "Width"),
+  MLE    = c(mean(final_results_df$mle_b - true_b, na.rm=TRUE),
+             mean((final_results_df$mle_b - true_b)^2, na.rm=TRUE),
+             mean(final_results_df$mle_cov_b, na.rm=TRUE),
+             mean(final_results_df$mle_width_b, na.rm=TRUE)),
+  Bayes  = c(mean(final_results_df$bayes_b - true_b, na.rm=TRUE),
+             mean((final_results_df$bayes_b - true_b)^2, na.rm=TRUE),
+             mean(final_results_df$bayes_cov_b, na.rm=TRUE),
+             mean(final_results_df$bayes_width_b, na.rm=TRUE))
+)
+avg_times <- data.frame(
+  Method = c("MLE Time", "Bayes Time"),
+  Seconds = c(mean(final_results_df$mle_time, na.rm=TRUE),
+              mean(final_results_df$bayes_time, na.rm=TRUE))
+)
+
+cat("\n--- Summary Results for Parameter 'a' ---\n")
+print(summary_a, row.names=FALSE)
+cat("\n--- Summary Results for Parameter 'b' ---\n")
+print(summary_b, row.names=FALSE)
+cat("\n--- Average Computation Time ---\n")
+print(avg_times, row.names=FALSE)
+```
+
+
+
+
+##### ultra pro max finallll
+```{r}
+### 1. Load Libraries
+# You may need to run: install.packages(c("future", "future.apply", "rstan"))
+library(future)
+library(future.apply)
+library(rstan)
+library(VGAM)
+library(optimx)
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+### 2. Pre-compile the Stan Model (THE KEY SPEED IMPROVEMENT)
+# This reads and compiles the NEW Stan model for progressive censoring.
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+cat("Pre-compiling the Stan model... (This may take a minute)\n")
+stan_model_compiled <- rstan::stan_model("dagum_model_progressive.stan")
+cat("...Stan model compiled.\n")
+
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+### 3. Define Helper & Main Simulation Functions
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+# NEW log-likelihood for PROGRESSIVE censoring
+negloglik_dagum_progressive_censored <- function(par, data, R, p_fixed) {
+  a <- par[1]; b <- par[2]
+  if (a <= 0 || b <= 0 || !is.finite(a) || !is.finite(b)) return(1e20)
+  
+  # Log-likelihood from the r observed failures
+  loglik_failures <- sum(VGAM::ddagum(x = data, scale = b, shape1.a = a, shape2.p = p_fixed, log = TRUE))
+  
+  # Log-likelihood from the progressively removed units
+  loglik_censored <- sum(R * VGAM::pdagum(q = data, scale = b, shape1.a = a, shape2.p = p_fixed, lower.tail = FALSE, log.p = TRUE))
+  
+  -1 * (loglik_failures + loglik_censored)
+}
+
+
+run_one_simulation <- function(sim_id, n_total, r, R_planned, T_ideal, true_a, true_b, true_p, compiled_model) {
+  
+  set.seed(100 + sim_id)
+  
+  # --- ADAPTIVE PROGRESSIVE CENSORING SIMULATION ---
+  y_full <- sort(VGAM::rdagum(n = n_total, scale = true_b, shape1.a = true_a, shape2.p = true_p))
+  
+  y_obs <- numeric(r)
+  R_final <- R_planned
+  
+  current_n <- n_total
+  full_data_idx <- 1
+  adapted <- FALSE
+  
+  for (i in 1:r) {
+    y_obs[i] <- y_full[full_data_idx]
+    
+    if (!adapted && y_obs[i] > T_ideal) {
+      adapted <- TRUE
+      removed_so_far <- if (i > 1) sum(R_final[1:(i-1)]) else 0
+      if (i < r) {
+        R_final[(i):r] <- 0
+      }
+      R_final[r] <- n_total - r - removed_so_far
+    }
+    
+    n_removed_this_step <- 1 + R_final[i]
+    full_data_idx <- full_data_idx + n_removed_this_step
+    current_n <- current_n - n_removed_this_step
+  }
+  
+  y <- ifelse(y_obs <= 0, 1e-6, y_obs)
+  N <- length(y)
+  
+  # --- Added 'divergences' column to the results data frame ---
+  results <- data.frame(mle_a=NA, mle_b=NA, bayes_a=NA, bayes_b=NA,
+                        mle_cov_a=NA, mle_cov_b=NA, bayes_cov_a=NA, bayes_cov_b=NA,
+                        mle_width_a=NA, mle_width_b=NA, bayes_width_a=NA, bayes_width_b=NA,
+                        mle_time=NA, bayes_time=NA, adapted=adapted, divergences=NA)
+
+  # --- Bayesian Estimation using the pre-compiled Stan model ---
+  bayes_start_time <- Sys.time()
+  stan_data <- list(N_obs = N, y_obs = y, R = R_final, p = true_p)
+  
+  # I recommend you add the control = list(...) argument here as discussed
+  stan_fit <- try(rstan::sampling(object = compiled_model,
+                                  data = stan_data,
+                                  chains = 2, iter = 2000, warmup = 1000,
+                                  verbose = FALSE, refresh = 0,
+                                  control = list(adapt_delta = 0.95)), silent = TRUE)
+  
+  results$bayes_time <- as.numeric(difftime(Sys.time(), bayes_start_time, units="secs"))
+  
+  if (!inherits(stan_fit, "try-error")) {
+    
+    # *** NEW CODE BLOCK TO CHECK FOR DIVERGENCES ***
+    # This should be the first thing you check after sampling is complete.
+    sampler_params <- get_sampler_params(stan_fit, inc_warmup = FALSE)
+    divergences <- sum(sapply(sampler_params, function(x) sum(x[, "divergent__"])))
+    results$divergences <- divergences # Store the count
+    
+    if (divergences > 0) {
+        # This will print a warning to the console during the simulation run
+        cat(paste("Warning: Simulation", sim_id, "had", divergences, "divergent transitions.\n"))
+    }
+    # *************************************************
+
+    summary_stats <- rstan::summary(stan_fit)$summary
+    rhats <- summary_stats[, "Rhat"]
+    
+    # A model with divergences is unreliable, but we can still extract results
+    # for diagnosis. You might add `&& divergences == 0` to this if-statement
+    # to only consider non-divergent runs as valid.
+    if (all(rhats < 1.1, na.rm = TRUE)) {
+        results$bayes_a <- mean(as.matrix(stan_fit)[,"a"])
+        results$bayes_b <- mean(as.matrix(stan_fit)[,"b"])
+        cred_intervals <- summary_stats[c("a","b"), c("2.5%", "97.5%")]
+        results$bayes_width_a <- cred_intervals["a","97.5%"] - cred_intervals["a","2.5%"]
+        results$bayes_width_b <- cred_intervals["b","97.5%"] - cred_intervals["b","2.5%"]
+        results$bayes_cov_a <- (true_a > cred_intervals["a","2.5%"] && true_a < cred_intervals["a","97.5%"])
+        results$bayes_cov_b <- (true_b > cred_intervals["b","2.5%"] && true_b < cred_intervals["b","2.5%"])
+    }
+  }
+
+  # --- MLE Estimation ---
+  # (No changes to the MLE part)
+  mle_start_time <- Sys.time()
+  start_par <- c(true_a * runif(1, 0.8, 1.2), true_b * runif(1, 0.8, 1.2))
+  mle_fit <- try(optimx::optimx(par=start_par, fn=negloglik_dagum_progressive_censored, 
+                                data=y, R=R_final, p_fixed=true_p,
+                                method="nlminb", lower=c(1e-5, 1e-5), hessian=TRUE), silent=TRUE)
+  results$mle_time <- as.numeric(difftime(Sys.time(), mle_start_time, units="secs"))
+  if (!inherits(mle_fit, "try-error") && mle_fit$convcode == 0) {
+    results$mle_a <- mle_fit$p1
+    results$mle_b <- mle_fit$p2
+    hessian_matrix <- attr(mle_fit, "details")[["nlminb", "nhatend"]]
+      if (!is.null(hessian_matrix) && is.matrix(hessian_matrix)) {
+        fisher_info <- try(solve(hessian_matrix), silent=TRUE)
+        if (!inherits(fisher_info, "try-error") && all(diag(fisher_info) > 0)) {
+          std_errors <- sqrt(diag(fisher_info))
+          ci_a <- results$mle_a + c(-1,1) * 1.96 * std_errors[1]
+          ci_b <- results$mle_b + c(-1,1) * 1.96 * std_errors[2]
+          results$mle_width_a <- ci_a[2] - ci_a[1]
+          results$mle_width_b <- ci_b[2] - ci_b[1]
+          results$mle_cov_a <- (true_a > ci_a[1] && true_a < ci_a[2])
+          results$mle_cov_b <- (true_b > ci_b[1] && true_b < ci_b[2])
+        }
+      }
+  }
+  return(results)
+}
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+### 4. Main Script to Run Simulation (Fast & Crash-Proof)
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+n_sim <- 1000  
+n_total <- 100
+r <- 60
+true_a <- 2.5
+true_b <- 1.5
+true_p <- 1.2
+
+# --- PARAMETERS FOR ADAPTIVE PROGRESSIVE CENSORING ---
+# Ideal time limit for the experiment. If a failure occurs after this time,
+# the removal plan will adapt to finish the experiment faster.
+T_ideal <- 2.0 
+
+# Planned Censoring Scheme R: (R_1, R_2, ..., R_r)
+# This scheme removes n_total - r units at the very end.
+# It is equivalent to conventional Type-II censoring IF NOT ADAPTED.
+R_planned <- c(rep(0, r - 1), n_total - r) 
+
+# Example of a different scheme: remove 2 units at the 10th failure,
+# 3 at the 20th, and the rest at the end.
+# R_planned <- rep(0, r)
+# R_planned[10] <- 2
+# R_planned[20] <- 3
+# R_planned[r] <- n_total - r - sum(R_planned)
+
+
+# This tells R to run each simulation in a new, clean R session.
+plan(multisession)
+
+cat("Starting", n_sim, "simulations in parallel...\n")
+start_time <- Sys.time()
+
+# We use future_lapply, which is crash-proof and has a progress bar.
+# Pass the new parameters to the simulation function.
+results_list <- future_lapply(1:n_sim, FUN = run_one_simulation,
+                              n_total=n_total, r=r, R_planned=R_planned, T_ideal=T_ideal,
+                              true_a=true_a, true_b=true_b, true_p=true_p,
+                              compiled_model = stan_model_compiled,
+                              future.seed = TRUE) # Ensures reproducibility
+
+end_time <- Sys.time()
+cat("...simulations complete. Total time:", round(end_time - start_time, 2), "seconds\n")
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+### 5. Process and Summarize Results
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+final_results_df <- do.call(rbind, results_list)
+
+summary_a <- data.frame(
+  Metric = c("Bias", "MSE", "Coverage", "Width"),
+  MLE    = c(mean(final_results_df$mle_a - true_a, na.rm=TRUE),
+             mean((final_results_df$mle_a - true_a)^2, na.rm=TRUE),
+             mean(final_results_df$mle_cov_a, na.rm=TRUE),
+             mean(final_results_df$mle_width_a, na.rm=TRUE)),
+  Bayes  = c(mean(final_results_df$bayes_a - true_a, na.rm=TRUE),
+             mean((final_results_df$bayes_a - true_a)^2, na.rm=TRUE),
+             mean(final_results_df$bayes_cov_a, na.rm=TRUE),
+             mean(final_results_df$bayes_width_a, na.rm=TRUE))
+)
+summary_b <- data.frame(
+  Metric = c("Bias", "MSE", "Coverage", "Width"),
+  MLE    = c(mean(final_results_df$mle_b - true_b, na.rm=TRUE),
+             mean((final_results_df$mle_b - true_b)^2, na.rm=TRUE),
+             mean(final_results_df$mle_cov_b, na.rm=TRUE),
+             mean(final_results_df$mle_width_b, na.rm=TRUE)),
+  Bayes  = c(mean(final_results_df$bayes_b - true_b, na.rm=TRUE),
+             mean((final_results_df$bayes_b - true_b)^2, na.rm=TRUE),
+             mean(final_results_df$bayes_cov_b, na.rm=TRUE),
+             mean(final_results_df$bayes_width_b, na.rm=TRUE))
+)
+avg_times <- data.frame(
+  Method = c("MLE Time", "Bayes Time"),
+  Seconds = c(mean(final_results_df$mle_time, na.rm=TRUE),
+              mean(final_results_df$bayes_time, na.rm=TRUE))
+)
+
+cat("\n--- Summary Results for Parameter 'a' ---\n")
+print(summary_a, row.names=FALSE)
+cat("\n--- Summary Results for Parameter 'b' ---\n")
+print(summary_b, row.names=FALSE)
+cat("\n--- Average Computation Time ---\n")
+print(avg_times, row.names=FALSE)
+cat("\n--- Adaptive Scheme Trigger Summary ---\n")
+cat(sprintf("The censoring scheme was adapted in %.2f%% of simulations.\n", 
+            mean(final_results_df$adapted, na.rm=TRUE) * 100))
+```
+
+
+
+### simple sample
+```{r}
+library(future)
+library(future.apply)
+library(rstan)
+library(VGAM)
+library(optimx)
+### --- DIAGNOSTIC TEST --- ###
+
+cat("Compiling the SIMPLE diagnostic model...\n")
+simple_model_compiled <- rstan::stan_model("dagum_simple_model.stan")
+
+cat("Running a single diagnostic simulation on UNCENSORED data...\n")
+
+# Generate one full dataset
+set.seed(101)
+y_full <- VGAM::rdagum(n = 100, scale = 1.5, shape1.a = 2.5, shape2.p = 1.2)
+
+# Prepare data for the simple Stan model
+simple_stan_data <- list(N = length(y_full), y = y_full, p = 1.2)
+
+# Fit the simple model
+simple_fit <- rstan::sampling(object = simple_model_compiled,
+                              data = simple_stan_data,
+                              chains = 2, iter = 2000,
+                              control = list(adapt_delta = 0.95))
+
+# Check the results of the simple model
+cat("\n--- Results from the SIMPLE diagnostic model ---\n")
+print(simple_fit, pars = c("a", "b"))
+
+### --- END OF DIAGNOSTIC TEST --- ###
+```
+
