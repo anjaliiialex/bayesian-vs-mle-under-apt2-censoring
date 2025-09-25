@@ -1,0 +1,27 @@
+Dagum Distribution
+
+1. Pdf
+Let \( X \sim \text{Dagum}(a, b, p) \), where \( a > 0 \), \( b > 0 \), and \( p > 0 \) are the shape and scale parameters of the distribution. The probability density function is given by:
+
+\[
+f(x; a, b, p) = \frac{a p}{x} \left( \frac{x}{b} \right)^{a p} \left[ 1 + \left( \frac{x}{b} \right)^a \right]^{-(p + 1)}, \quad x > 0.
+\]
+
+2. cdf
+\[
+F(x; a, b, p) = \left[ 1 + \left( \frac{b}{x} \right)^a \right]^{-p},
+\]
+
+3. Survival func
+\[
+S(x) = 1 - F(x) = \left[ 1 + \left( \frac{b}{x} \right)^a \right]^{-p}.
+\]
+
+4. Hazard func
+The hazard or failure rate function, which describes the instantaneous rate of failure at any time \( x \), is defined as:
+
+\[
+h(x) = \frac{f(x)}{S(x)} = \frac{a p}{x} \left( \frac{x}{b} \right)^{a p} \left[ 1 + \left( \frac{x}{b} \right)^a \right]^{-1}.
+\]
+
+

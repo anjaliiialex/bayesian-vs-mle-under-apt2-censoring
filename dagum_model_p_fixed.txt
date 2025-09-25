@@ -1,0 +1,12 @@
+model {
+  # Likelihood: p is now treated as data, not a parameter
+  for (i in 1:N) {
+    log_pdf[i] <- log(a) + log(p) - a*p*log(b) + (a*p - 1)*log(y[i]) - (p + 1)*log(1 + pow(y[i]/b, a))
+    phi[i] <- -log_pdf[i] + 10000 # Constant for stability
+    zeros[i] ~ dpois(phi[i])
+  }
+
+  # Priors for the remaining parameters
+  a ~ dgamma(1, 0.1)
+  b ~ dgamma(1, 0.1)
+}

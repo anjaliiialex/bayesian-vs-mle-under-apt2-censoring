@@ -1,0 +1,43 @@
+// --- Save this code as 'dagum_model.stan' ---
+functions {
+  // We define the log-likelihood of the Dagum distribution as a function
+  real dagum_lpdf(real y, real a, real b, real p) {
+    return log(a) + log(p) - log(b) + (a*p - 1)*(log(y) - log(b)) 
+           - (p + 1)*log(1 + pow(y/b, a));
+  }
+  
+  // We define the log-survival function for censoring
+  real dagum_lccdf(real y, real a, real b, real p) {
+    real cdf = pow(1 + pow(b/y, a), -p);
+    return log(1.0 - cdf + 1e-20); // Add small constant for stability
+  }
+}
+
+data {
+  int<lower=0> N_obs;      // Number of observed failures
+  int<lower=0> N_cens;     // Number of censored items
+  vector[N_obs] y_obs;     // The failure times
+  real<lower=0> T_cens;    // The time of censoring
+  real<lower=0> p;         // The fixed 'p' parameter
+}
+
+parameters {
+  real<lower=0.01> a;      // Parameter 'a', constrained to be positive
+  real<lower=0.01> b;      // Parameter 'b', constrained to be positive
+}
+
+model {
+  // Priors (weakly informative and stable)
+  a ~ uniform(0.01, 50);
+  b ~ uniform(0.01, 50);
+  
+  // Likelihood for observed data
+  for (i in 1:N_obs) {
+    target += dagum_lpdf(y_obs[i] | a, b, p);
+  }
+  
+  // Likelihood for censored data
+  if (N_cens > 0) {
+    target += N_cens * dagum_lccdf(T_cens | a, b, p);
+  }
+}

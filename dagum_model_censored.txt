@@ -1,0 +1,30 @@
+# --- This is the final, STABLE content for 'dagum_model_censored.txt' ---
+model {
+  # =================================================================
+  # Part 1: Likelihood for the 'r' observed failures
+  # =================================================================
+  for (i in 1:N) {
+    log_pdf[i] <- log(a) + log(p) - log(b) + (a*p - 1)*(log(y[i]) - log(b)) - (p + 1)*log(1 + pow(y[i]/b, a))
+    lambda[i] <- -log_pdf[i]
+    zeros[i] ~ dpois(lambda[i])
+  }
+
+  # =================================================================
+  # Part 2: Likelihood for the 'n_cens' censored items
+  # =================================================================
+  cdf_val <- pow(1 + pow(b/T_c, a), -p)
+  log_survival_prob <- log(1 - cdf_val + 1E-20) # Stability trick
+  lambda_cens <- -n_cens * log_survival_prob
+  censor_zero ~ dpois(lambda_cens)
+  
+  # =================================================================
+  # Part 3: Priors for the parameters (THE ONLY CHANGE IS HERE)
+  # =================================================================
+  # Old, unstable priors:
+  # a ~ dgamma(0.001, 0.001)
+  # b ~ dgamma(0.001, 0.001)
+
+  # New, more stable priors that prevent extreme values:
+  a ~ dunif(0.01, 50)
+  b ~ dunif(0.01, 50)
+}
